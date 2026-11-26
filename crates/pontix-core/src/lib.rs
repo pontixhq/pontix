@@ -5,6 +5,10 @@
 //! two Odoo versions, and the findings reported to users (PTX codes).
 #![forbid(unsafe_code)]
 
+pub mod symbol;
+
+pub use symbol::{FieldDef, FieldName, Location, MethodDef, ModelDef, ModelName};
+
 /// Version of the Pontix core crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
