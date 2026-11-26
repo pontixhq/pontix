@@ -9,6 +9,8 @@ yanked = "deny"
 [licenses]
 version = 2
 confidence-threshold = 0.9
+# The allow list is shared policy; not every license is used yet.
+unused-allowed-license = "allow"
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -26,6 +28,8 @@ private = { ignore = true }
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace crates depend on each other by path; that is not a crates.io wildcard.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
