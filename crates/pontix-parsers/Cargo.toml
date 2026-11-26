@@ -1,0 +1,18 @@
+[package]
+name = "pontix-parsers"
+description = "Python and XML parsers that extract Odoo symbols for Pontix."
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+pontix-core = { path = "../pontix-core" }
