@@ -6,12 +6,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pontix_core::{FieldName, FieldType, Location, MethodDef, ModelName, ModuleName};
+use pontix_core::storage::{self, Storage};
+use pontix_core::{
+    FieldAttrs, FieldName, FieldType, Location, MethodDef, ModelName, ModuleName, Written,
+};
 use pontix_index::Installation;
 
 pub(crate) struct ModelView<'a> {
     /// Where the model is first defined.
     pub(crate) first: Location,
+    /// Whether it has a table: `None` when Pontix cannot tell.
+    pub(crate) has_table: Option<bool>,
     /// Fields its own definitions declare.
     pub(crate) fields: BTreeMap<&'a FieldName, FieldView<'a>>,
     /// Methods its own definitions define.
@@ -19,13 +24,13 @@ pub(crate) struct ModelView<'a> {
     /// Fields it only has through another model, with where they are
     /// declared. A model that stops inheriting `mail.thread` loses
     /// `message_ids` although none of its own code changed.
-    pub(crate) inherited_fields: BTreeMap<&'a FieldName, &'a Location>,
+    pub(crate) inherited_fields: BTreeMap<&'a FieldName, FieldView<'a>>,
     /// Methods it only has through another model, with where they are
     /// defined.
     pub(crate) inherited_methods: BTreeMap<&'a str, &'a Location>,
     /// Fields reachable through `_inherits`, as `email` on `res.users`
     /// through `res.partner`. Their changes are reported on that model.
-    pub(crate) delegated_fields: BTreeSet<&'a FieldName>,
+    pub(crate) delegated_fields: BTreeMap<&'a FieldName, FieldView<'a>>,
     /// The other models it inherits from.
     pub(crate) parents: BTreeSet<ModelName>,
     /// The models it delegates to.
@@ -36,15 +41,25 @@ impl<'a> ModelView<'a> {
     /// Whether the field can be reached on the model at all: own,
     /// inherited, or through delegation.
     pub(crate) fn reaches_field(&self, field: &FieldName) -> bool {
-        self.field_location(field).is_some() || self.delegated_fields.contains(field)
+        self.field_location(field).is_some() || self.delegated_fields.contains_key(field)
+    }
+
+    /// A field the model has, own or inherited.
+    pub(crate) fn field(&self, field: &FieldName) -> Option<&FieldView<'a>> {
+        self.fields
+            .get(field)
+            .or_else(|| self.inherited_fields.get(field))
     }
 
     /// Where a field the model has, own or inherited, is declared.
     pub(crate) fn field_location(&self, field: &FieldName) -> Option<&'a Location> {
-        self.fields
-            .get(field)
-            .map(|view| view.first)
-            .or_else(|| self.inherited_fields.get(field).copied())
+        self.field(field).map(|view| view.first)
+    }
+
+    /// Where a field the model has keeps its values on this model, whose
+    /// table decides as much as the field's own arguments.
+    pub(crate) fn storage(&self, field: &FieldView<'_>) -> Storage {
+        storage::storage(field.field_type, &field.attrs, self.has_table)
     }
 
     /// Whether the model has the method, own or inherited.
@@ -53,6 +68,7 @@ impl<'a> ModelView<'a> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct FieldView<'a> {
     /// The module whose definition declares the field first.
     pub(crate) owner: &'a ModuleName,
@@ -64,6 +80,25 @@ pub(crate) struct FieldView<'a> {
     pub(crate) type_at: &'a Location,
     /// The comodel of the last declaration that names one, and where.
     pub(crate) comodel: Option<(&'a ModelName, &'a Location)>,
+    /// The arguments every declaration writes, merged in load order.
+    pub(crate) attrs: FieldAttrs,
+}
+
+impl FieldView<'_> {
+    /// The keys a selection field accepts.
+    pub(crate) fn selection_keys(&self) -> Written<Vec<String>> {
+        storage::selection_keys(&self.attrs)
+    }
+
+    /// Adds a later declaration: one of another type replaces the field and
+    /// its arguments.
+    fn redeclare(&mut self, field_type: &FieldType, attrs: &FieldAttrs) {
+        self.attrs = if self.field_type == field_type {
+            storage::merge(&self.attrs, attrs)
+        } else {
+            attrs.clone()
+        };
+    }
 }
 
 pub(crate) struct MethodView<'a> {
@@ -82,13 +117,25 @@ pub(crate) fn models<'a>(installation: &Installation<'a>) -> BTreeMap<ModelName,
         let Some(first) = definitions.first() else {
             continue;
         };
+        // The class that defines the model decides its kind; any class may
+        // set `_auto` or `_table_query`, and the last one to set `_auto` wins.
+        let auto = definitions
+            .iter()
+            .rev()
+            .map(|definition| &definition.def.auto)
+            .find(|auto| auto.is_given())
+            .unwrap_or(&Written::Absent);
+        let table_query = definitions
+            .iter()
+            .any(|definition| definition.def.table_query);
         let mut view = ModelView {
             first: first.def.location.clone(),
+            has_table: storage::has_table(first.def.base, auto, table_query),
             fields: BTreeMap::new(),
             methods: BTreeMap::new(),
             inherited_fields: BTreeMap::new(),
             inherited_methods: BTreeMap::new(),
-            delegated_fields: BTreeSet::new(),
+            delegated_fields: BTreeMap::new(),
             parents: BTreeSet::new(),
             delegates: BTreeSet::new(),
         };
@@ -110,7 +157,9 @@ pub(crate) fn models<'a>(installation: &Installation<'a>) -> BTreeMap<ModelName,
                     field_type: &field.field_type,
                     type_at: &field.location,
                     comodel: None,
+                    attrs: FieldAttrs::default(),
                 });
+                entry.redeclare(&field.field_type, &field.attrs);
                 entry.field_type = &field.field_type;
                 entry.type_at = &field.location;
                 if let Some(comodel) = &field.comodel {
@@ -137,10 +186,10 @@ pub(crate) fn models<'a>(installation: &Installation<'a>) -> BTreeMap<ModelName,
 
 /// Gives each model the fields of the models it delegates to, own and
 /// inherited, through any depth.
-fn delegate(views: &mut BTreeMap<ModelName, ModelView<'_>>) {
+fn delegate<'a>(views: &mut BTreeMap<ModelName, ModelView<'a>>) {
     let names: Vec<ModelName> = views.keys().cloned().collect();
     for name in names {
-        let mut reached = BTreeSet::new();
+        let mut reached = BTreeMap::new();
         let mut seen = BTreeSet::from([name.clone()]);
         let mut pending: Vec<ModelName> = views[&name].delegates.iter().cloned().collect();
         while let Some(target) = pending.pop() {
@@ -150,8 +199,9 @@ fn delegate(views: &mut BTreeMap<ModelName, ModelView<'_>>) {
             let Some(view) = views.get(&target) else {
                 continue;
             };
-            reached.extend(view.fields.keys().copied());
-            reached.extend(view.inherited_fields.keys().copied());
+            for (field, found) in view.fields.iter().chain(&view.inherited_fields) {
+                reached.entry(*field).or_insert_with(|| found.clone());
+            }
             pending.extend(view.delegates.iter().cloned());
         }
         if let Some(view) = views.get_mut(&name) {
@@ -177,7 +227,7 @@ fn inherit<'a>(views: &mut BTreeMap<ModelName, ModelView<'a>>) {
                 continue;
             };
             for (field, own) in &view.fields {
-                fields.entry(*field).or_insert(own.first);
+                fields.entry(*field).or_insert_with(|| own.clone());
             }
             for (method, own) in &view.methods {
                 methods.entry(*method).or_insert(&own.first.location);
@@ -187,6 +237,15 @@ fn inherit<'a>(views: &mut BTreeMap<ModelName, ModelView<'a>>) {
         let Some(view) = views.get_mut(&name) else {
             continue;
         };
+        // A model's own declaration of a field it also inherits builds on
+        // the inherited one, as Odoo merges the arguments of every class.
+        for (field, own) in &mut view.fields {
+            if let Some(inherited) = fields.get(field)
+                && inherited.field_type == own.field_type
+            {
+                own.attrs = storage::merge(&inherited.attrs, &own.attrs);
+            }
+        }
         fields.retain(|field, _| !view.fields.contains_key(field));
         methods.retain(|method, _| !view.methods.contains_key(method));
         view.inherited_fields = fields;

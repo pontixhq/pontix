@@ -10,6 +10,7 @@ pub mod diagnostic;
 pub mod field_type;
 pub mod manifest;
 pub mod resolve;
+pub mod storage;
 pub mod symbol;
 pub mod version;
 
@@ -18,8 +19,10 @@ pub use diagnostic::{Diagnostic, DiagnosticKind};
 pub use field_type::FieldType;
 pub use manifest::{AutoInstall, Manifest, ModuleName};
 pub use resolve::ModelKind;
+pub use storage::Storage;
 pub use symbol::{
-    Delegation, FieldDef, FieldName, Inherit, Location, MethodDef, ModelDef, ModelName,
+    Delegation, FieldAttrs, FieldDef, FieldName, Inherit, Location, MethodDef, ModelBase, ModelDef,
+    ModelName, Written,
 };
 pub use version::OdooVersion;
 

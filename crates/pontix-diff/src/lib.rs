@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::path::Path;
 
-use pontix_core::{Change, ChangeSet, FieldName, Location, ModelName};
+use pontix_core::{Change, ChangeSet, FieldName, Location, ModelName, Storage, Written};
 use pontix_index::Installation;
 
 use crate::view::{FieldView, MethodView, ModelView, models};
@@ -42,6 +42,7 @@ pub fn diff(source: &Installation<'_>, target: &Installation<'_>) -> ChangeSet {
             (Some(old), Some(new)) => diff_model(name, old, new, &mut changes),
             (Some(old), None) => changes.push(Change::ModelRemoved {
                 model: name.clone(),
+                had_table: old.has_table,
                 before: old.first.clone(),
             }),
             (None, Some(new)) => changes.push(Change::ModelAdded {
@@ -96,27 +97,46 @@ fn diff_model(
         .copied()
         .collect();
     for field in fields {
-        if let (Some(before), Some(after)) = (old.fields.get(field), new.fields.get(field)) {
-            compare_field(model, field, before, after, changes);
-            continue;
-        }
         // A field counts as there however the model reaches it: one that
         // moved into a mixin or a delegated model is not removed. Fields only
         // reached through delegation are reported on their own model.
-        match (old.field_location(field), new.field_location(field)) {
-            (Some(_), None) if new.reaches_field(field) => {}
-            (None, Some(_)) if old.reaches_field(field) => {}
+        match (old.field(field), new.field(field)) {
+            (Some(before), Some(after)) => {
+                if let (Some(before), Some(after)) = (old.fields.get(field), new.fields.get(field))
+                {
+                    compare_field(model, field, before, after, changes);
+                }
+                compare_data(model, field, (old, before), (new, after), changes);
+            }
+            // Reached through delegation instead, or the other way round: the
+            // values move between this model's table and the delegated one.
+            (Some(before), None) if new.reaches_field(field) => {
+                if let Some(after) = new.delegated_fields.get(field) {
+                    let from = old.storage(before);
+                    let place = (before.type_at, after.type_at);
+                    storage_change(model, field, from, Storage::NotStored, place, changes);
+                }
+            }
+            (None, Some(after)) if old.reaches_field(field) => {
+                if let Some(before) = old.delegated_fields.get(field) {
+                    let to = new.storage(after);
+                    let place = (before.type_at, after.type_at);
+                    storage_change(model, field, Storage::NotStored, to, place, changes);
+                }
+            }
             (Some(before), None) => changes.push(Change::FieldRemoved {
                 model: model.clone(),
                 field: field.clone(),
-                before: before.clone(),
+                storage: old.storage(before),
+                before: before.first.clone(),
             }),
             (None, Some(after)) => changes.push(Change::FieldAdded {
                 model: model.clone(),
                 field: field.clone(),
-                after: after.clone(),
+                storage: new.storage(after),
+                after: after.first.clone(),
             }),
-            _ => {}
+            (None, None) => {}
         }
     }
 
@@ -148,6 +168,56 @@ fn diff_model(
             }
             _ => {}
         }
+    }
+}
+
+/// Compares where a field both versions have keeps its values, and the keys
+/// a selection field accepts: what the rows already in the database rely on.
+fn compare_data(
+    model: &ModelName,
+    field: &FieldName,
+    (old, before): (&ModelView<'_>, &FieldView<'_>),
+    (new, after): (&ModelView<'_>, &FieldView<'_>),
+    changes: &mut Vec<Change>,
+) {
+    let (from, to) = (old.storage(before), new.storage(after));
+    let place = (before.type_at, after.type_at);
+    storage_change(model, field, from, to, place, changes);
+    if let (Written::Value(was), Written::Value(now)) =
+        (before.selection_keys(), after.selection_keys())
+    {
+        let keys: Vec<String> = was.into_iter().filter(|key| !now.contains(key)).collect();
+        if !keys.is_empty() {
+            changes.push(Change::SelectionKeysRemoved {
+                model: model.clone(),
+                field: field.clone(),
+                keys,
+                storage: from,
+                before: before.type_at.clone(),
+                after: after.type_at.clone(),
+            });
+        }
+    }
+}
+
+/// Reports a field whose values move, when both places are known.
+fn storage_change(
+    model: &ModelName,
+    field: &FieldName,
+    from: Storage,
+    to: Storage,
+    (before, after): (&Location, &Location),
+    changes: &mut Vec<Change>,
+) {
+    if from != to && from != Storage::Unknown && to != Storage::Unknown {
+        changes.push(Change::FieldStorageChanged {
+            model: model.clone(),
+            field: field.clone(),
+            from,
+            to,
+            before: before.clone(),
+            after: after.clone(),
+        });
     }
 }
 
@@ -237,8 +307,8 @@ mod tests {
     use std::path::PathBuf;
 
     use pontix_core::{
-        AutoInstall, Confidence, FieldDef, FieldName, FieldType, Inherit, Manifest, MethodDef,
-        ModelDef, ModuleName, OdooVersion, Rename,
+        AutoInstall, Confidence, FieldAttrs, FieldDef, FieldName, FieldType, Inherit, Manifest,
+        MethodDef, ModelBase, ModelDef, ModuleName, OdooVersion, Rename,
     };
     use pontix_index::{Addons, Module, install};
 
@@ -253,6 +323,7 @@ mod tests {
             name: FieldName::new(name),
             field_type,
             comodel: comodel.map(ModelName::new),
+            attrs: FieldAttrs::default(),
             location: at("models.py", line),
         }
     }
@@ -278,6 +349,9 @@ mod tests {
             name: (inherit == Inherit::Absent).then_some(ModelName::new(name)),
             inherit,
             inherits: Vec::new(),
+            base: ModelBase::Model,
+            auto: Written::Absent,
+            table_query: false,
             fields,
             methods,
             location: at("models.py", 1),
@@ -368,6 +442,7 @@ mod tests {
                 },
                 Change::ModelRemoved {
                     model: name("legacy.thing"),
+                    had_table: Some(true),
                     before: at("models.py", 1),
                 },
                 Change::ModelAdded {
@@ -450,11 +525,13 @@ mod tests {
                 Change::FieldRemoved {
                     model: name("sale.order.line"),
                     field: FieldName::new("product_uom"),
+                    storage: Storage::Column,
                     before: at("models.py", 10),
                 },
                 Change::FieldAdded {
                     model: name("sale.order.line"),
                     field: FieldName::new("product_uom_id"),
+                    storage: Storage::Column,
                     after: at("models.py", 30),
                 },
                 Change::FieldMoved {
@@ -790,6 +867,7 @@ mod tests {
                 Change::FieldAdded {
                     model: name("mail.thread"),
                     field: FieldName::new("note"),
+                    storage: Storage::Column,
                     after: at("models.py", 2),
                 },
                 Change::ParentRemoved {
@@ -800,13 +878,202 @@ mod tests {
                 Change::FieldRemoved {
                     model: name("maintenance.request"),
                     field: FieldName::new("message_ids"),
+                    // A One2many has no column of its own.
+                    storage: Storage::NotStored,
                     before: at("models.py", 1),
                 },
                 // Reported once, on the model that owns it, not on `res.users`.
                 Change::FieldRemoved {
                     model: name("res.partner"),
                     field: FieldName::new("fax"),
+                    storage: Storage::Column,
                     before: at("models.py", 7),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn storage_and_selection_keys_follow_every_declaration() {
+        let with = |field: FieldDef, attrs: FieldAttrs| FieldDef { attrs, ..field };
+        let keys = |values: &[&str]| Written::Value(values.iter().map(|v| v.to_string()).collect());
+        let computed = || FieldAttrs {
+            compute: Written::Value("_compute".to_string()),
+            ..FieldAttrs::default()
+        };
+        let stored = || FieldAttrs {
+            store: Written::Value(true),
+            ..FieldAttrs::default()
+        };
+        let mixin = |fields: Vec<FieldDef>| ModelDef {
+            base: ModelBase::Abstract,
+            ..model("portal.mixin", Inherit::Absent, fields, vec![])
+        };
+        let source = vec![
+            module(
+                "base",
+                &[],
+                vec![
+                    model(
+                        "sale.order",
+                        Inherit::Absent,
+                        vec![
+                            with(field("total", FieldType::Monetary, None, 2), computed()),
+                            with(
+                                field("state", FieldType::Selection, None, 3),
+                                FieldAttrs {
+                                    selection: keys(&["draft", "sent", "done"]),
+                                    ..FieldAttrs::default()
+                                },
+                            ),
+                        ],
+                        vec![],
+                    ),
+                    mixin(vec![with(
+                        field("access_url", FieldType::Char, None, 4),
+                        computed(),
+                    )]),
+                ],
+            ),
+            // An extension stores the computed field.
+            module(
+                "sale",
+                &["base"],
+                vec![model(
+                    "sale.order",
+                    extends("sale.order"),
+                    vec![with(field("total", FieldType::Monetary, None, 5), stored())],
+                    vec![],
+                )],
+            ),
+        ];
+        let target = vec![
+            module(
+                "base",
+                &[],
+                vec![
+                    model(
+                        "sale.order",
+                        Inherit::Absent,
+                        vec![
+                            with(field("total", FieldType::Monetary, None, 12), computed()),
+                            with(
+                                field("state", FieldType::Selection, None, 13),
+                                FieldAttrs {
+                                    selection: keys(&["draft", "done"]),
+                                    ..FieldAttrs::default()
+                                },
+                            ),
+                        ],
+                        vec![],
+                    ),
+                    // Removed from an abstract model: it never had a column.
+                    mixin(vec![]),
+                ],
+            ),
+            module("sale", &["base"], vec![]),
+        ];
+        assert_eq!(
+            changes(source, target),
+            [
+                Change::FieldRemoved {
+                    model: name("portal.mixin"),
+                    field: FieldName::new("access_url"),
+                    storage: Storage::NotStored,
+                    before: at("models.py", 4),
+                },
+                Change::SelectionKeysRemoved {
+                    model: name("sale.order"),
+                    field: FieldName::new("state"),
+                    keys: vec!["sent".to_string()],
+                    storage: Storage::Column,
+                    before: at("models.py", 3),
+                    after: at("models.py", 13),
+                },
+                Change::FieldStorageChanged {
+                    model: name("sale.order"),
+                    field: FieldName::new("total"),
+                    from: Storage::Column,
+                    to: Storage::NotStored,
+                    before: at("models.py", 5),
+                    after: at("models.py", 12),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_redeclared_mixin_field_keeps_the_mixin_arguments() {
+        let mixin = model(
+            "mail.thread",
+            Inherit::Absent,
+            vec![FieldDef {
+                attrs: FieldAttrs {
+                    compute: Written::Value("_compute_count".to_string()),
+                    ..FieldAttrs::default()
+                },
+                ..field("message_count", FieldType::Integer, None, 1)
+            }],
+            vec![],
+        );
+        let thread = |extra: Vec<FieldDef>| ModelDef {
+            name: Some(name("crm.lead")),
+            inherit: Inherit::List(vec![name("mail.thread")]),
+            ..model("crm.lead", Inherit::Absent, extra, vec![])
+        };
+        // Only the label changes: still computed, still not stored.
+        let source = vec![module(
+            "base",
+            &[],
+            vec![
+                mixin.clone(),
+                thread(vec![field("message_count", FieldType::Integer, None, 8)]),
+            ],
+        )];
+        let target = vec![module("base", &[], vec![mixin, thread(vec![])])];
+        assert_eq!(changes(source, target), []);
+    }
+
+    #[test]
+    fn a_field_moved_behind_delegation_leaves_the_table() {
+        let source = vec![module(
+            "base",
+            &[],
+            vec![model(
+                "hr.employee",
+                Inherit::Absent,
+                vec![field("job_title", FieldType::Char, None, 3)],
+                vec![],
+            )],
+        )];
+        let employee = ModelDef {
+            inherits: vec![pontix_core::Delegation {
+                parent: name("hr.version"),
+                field: FieldName::new("version_id"),
+            }],
+            ..model("hr.employee", Inherit::Absent, vec![], vec![])
+        };
+        let version = model(
+            "hr.version",
+            Inherit::Absent,
+            vec![field("job_title", FieldType::Char, None, 9)],
+            vec![],
+        );
+        let target = vec![module("base", &[], vec![employee, version])];
+        assert_eq!(
+            changes(source, target),
+            [
+                Change::FieldStorageChanged {
+                    model: name("hr.employee"),
+                    field: FieldName::new("job_title"),
+                    from: Storage::Column,
+                    to: Storage::NotStored,
+                    before: at("models.py", 3),
+                    after: at("models.py", 9),
+                },
+                Change::ModelAdded {
+                    model: name("hr.version"),
+                    after: at("models.py", 1),
                 },
             ]
         );

@@ -6,6 +6,7 @@
 
 use crate::field_type::FieldType;
 use crate::manifest::ModuleName;
+use crate::storage::Storage;
 use crate::symbol::{FieldName, Location, ModelName};
 use crate::version::OdooVersion;
 
@@ -128,6 +129,9 @@ pub enum Change {
     ModelRemoved {
         /// The model.
         model: ModelName,
+        /// Whether it had a table in the source version: `None` when Pontix
+        /// cannot tell. A table means rows the upgrade can lose.
+        had_table: Option<bool>,
         /// Its first definition in the source version.
         before: Location,
     },
@@ -165,6 +169,9 @@ pub enum Change {
         model: ModelName,
         /// The field.
         field: FieldName,
+        /// Where its values lived in the source version. A stored field
+        /// that goes away takes its data with it.
+        storage: Storage,
         /// Its first declaration in the source version.
         before: Location,
     },
@@ -174,7 +181,42 @@ pub enum Change {
         model: ModelName,
         /// The field.
         field: FieldName,
+        /// Where its values live in the target version.
+        storage: Storage,
         /// Its first declaration in the target version.
+        after: Location,
+    },
+    /// The field keeps its values somewhere else, for example a computed
+    /// field that is no longer stored, whose column the upgrade drops.
+    FieldStorageChanged {
+        /// The model.
+        model: ModelName,
+        /// The field.
+        field: FieldName,
+        /// Where its values lived in the source version.
+        from: Storage,
+        /// Where they live in the target version.
+        to: Storage,
+        /// Its last declaration in the source version.
+        before: Location,
+        /// Its last declaration in the target version.
+        after: Location,
+    },
+    /// A selection field no longer accepts some keys, which rows may still
+    /// hold.
+    SelectionKeysRemoved {
+        /// The model.
+        model: ModelName,
+        /// The field.
+        field: FieldName,
+        /// The keys it no longer accepts, in source order.
+        keys: Vec<String>,
+        /// Where its values lived in the source version: rows hold the old
+        /// keys only when it was stored.
+        storage: Storage,
+        /// Its last declaration in the source version.
+        before: Location,
+        /// Its last declaration in the target version.
         after: Location,
     },
     /// The field's type changed, for example `Char` to `Many2one`.
@@ -286,6 +328,8 @@ impl Change {
             | Self::ParentRemoved { model, .. }
             | Self::FieldRemoved { model, .. }
             | Self::FieldAdded { model, .. }
+            | Self::FieldStorageChanged { model, .. }
+            | Self::SelectionKeysRemoved { model, .. }
             | Self::FieldTypeChanged { model, .. }
             | Self::FieldComodelChanged { model, .. }
             | Self::FieldMoved { model, .. }

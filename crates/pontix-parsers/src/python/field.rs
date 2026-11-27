@@ -1,6 +1,6 @@
 //! Field declarations in a model class body: `name = fields.X(...)`.
 
-use pontix_core::{FieldType, ModelName};
+use pontix_core::{FieldAttrs, FieldType, ModelName, Written};
 use ruff_python_ast::{Expr, ExprCall};
 
 /// What the value of a class attribute declares, as far as fields go.
@@ -12,6 +12,8 @@ pub(super) enum Field {
         field_type: FieldType,
         /// The comodel, for relational types only.
         comodel: Comodel,
+        /// The arguments that decide how it is stored.
+        attrs: FieldAttrs,
     },
     /// Written with the name of a core field type but not as `fields.X(...)`,
     /// for example `Char(...)`, `f.Char(...)` or `fields.Char` without a call.
@@ -46,9 +48,11 @@ pub(super) fn field(value: &Expr, model_name: Option<&ModelName>) -> Option<Fiel
                 } else {
                     Comodel::Absent
                 };
+                let attrs = attrs(call, &field_type);
                 Some(Field::Declared {
                     field_type,
                     comodel,
+                    attrs,
                 })
             }
             func if names_core_field_type(func) => Some(Field::Unrecognized),
@@ -106,6 +110,84 @@ fn comodel(call: &ExprCall, model_name: Option<&ModelName>) -> Comodel {
     }
 }
 
+/// Reads `store=`, `compute=`, `related=`, `attachment=`, `selection=` and
+/// `selection_add=`. A `Selection` field also takes its selection as the
+/// first positional argument. With `**kwargs` in the call, any argument the
+/// call does not write explicitly may come from there, so it is unreadable.
+fn attrs(call: &ExprCall, field_type: &FieldType) -> FieldAttrs {
+    let mut attrs = FieldAttrs {
+        store: argument(call, "store", boolean),
+        compute: argument(call, "compute", method_name),
+        related: argument(call, "related", |value| string(value).map(str::to_string)),
+        attachment: argument(call, "attachment", boolean),
+        selection: argument(call, "selection", selection_keys),
+        selection_add: argument(call, "selection_add", selection_keys),
+    };
+    if *field_type == FieldType::Selection
+        && !attrs.selection.is_given()
+        && let Some(first) = call.arguments.args.first()
+    {
+        attrs.selection = selection_keys(first).map_or(Written::Unreadable, Written::Value);
+    }
+    attrs
+}
+
+/// The keyword argument `name`, read with `how`.
+fn argument<T>(call: &ExprCall, name: &str, how: impl Fn(&Expr) -> Option<T>) -> Written<T> {
+    let keywords = &call.arguments.keywords;
+    match keywords
+        .iter()
+        .find(|keyword| keyword.arg.as_ref().is_some_and(|arg| arg.as_str() == name))
+    {
+        Some(keyword) => how(&keyword.value).map_or(Written::Unreadable, Written::Value),
+        None if keywords.iter().any(|keyword| keyword.arg.is_none()) => Written::Unreadable,
+        None => Written::Absent,
+    }
+}
+
+fn boolean(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::BooleanLiteral(literal) => Some(literal.value),
+        _ => None,
+    }
+}
+
+fn string(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::StringLiteral(literal) => Some(literal.value.to_str()),
+        _ => None,
+    }
+}
+
+/// `compute="_compute_total"` or `compute=_compute_total`.
+fn method_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(name) => Some(name.id.as_str().to_string()),
+        other => string(other).map(str::to_string),
+    }
+}
+
+/// The keys of a list or tuple of `(key, label)` pairs; `selection_add` may
+/// also hold `(key,)` to place an existing key.
+fn selection_keys(expr: &Expr) -> Option<Vec<String>> {
+    let items = match expr {
+        Expr::List(list) => &list.elts,
+        Expr::Tuple(tuple) => &tuple.elts,
+        _ => return None,
+    };
+    items
+        .iter()
+        .map(|item| {
+            let pair = match item {
+                Expr::Tuple(tuple) => &tuple.elts,
+                Expr::List(list) => &list.elts,
+                _ => return None,
+            };
+            pair.first().and_then(string).map(str::to_string)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,10 +199,26 @@ mod tests {
     }
 
     fn declared(field_type: FieldType, comodel: Comodel) -> Option<Field> {
+        with_attrs(field_type, comodel, FieldAttrs::default())
+    }
+
+    fn with_attrs(field_type: FieldType, comodel: Comodel, attrs: FieldAttrs) -> Option<Field> {
         Some(Field::Declared {
             field_type,
             comodel,
+            attrs,
         })
+    }
+
+    fn attrs_of(source: &str) -> FieldAttrs {
+        match read(source) {
+            Some(Field::Declared { attrs, .. }) => attrs,
+            other => panic!("{source} is not a field declaration: {other:?}"),
+        }
+    }
+
+    fn keys(values: &[&str]) -> Written<Vec<String>> {
+        Written::Value(values.iter().map(|key| key.to_string()).collect())
     }
 
     #[test]
@@ -160,7 +258,14 @@ mod tests {
         );
         assert_eq!(
             read("fields.Many2one(related='order_id.partner_id')"),
-            declared(FieldType::Many2one, Comodel::Absent)
+            with_attrs(
+                FieldType::Many2one,
+                Comodel::Absent,
+                FieldAttrs {
+                    related: Written::Value("order_id.partner_id".to_string()),
+                    ..FieldAttrs::default()
+                }
+            )
         );
     }
 
@@ -181,13 +286,21 @@ mod tests {
         let parsed = parse_expression("fields.Many2one(_name, compute='_compute_root')")
             .expect("test source must be a valid expression");
         let category = ModelName::new("test_new_api.category");
+        let computed = || FieldAttrs {
+            compute: Written::Value("_compute_root".to_string()),
+            ..FieldAttrs::default()
+        };
         assert_eq!(
             field(&parsed.syntax().body, Some(&category)),
-            declared(FieldType::Many2one, Comodel::Named(category.clone()))
+            with_attrs(
+                FieldType::Many2one,
+                Comodel::Named(category.clone()),
+                computed()
+            )
         );
         assert_eq!(
             field(&parsed.syntax().body, None),
-            declared(FieldType::Many2one, Comodel::Unreadable)
+            with_attrs(FieldType::Many2one, Comodel::Unreadable, computed())
         );
     }
 
@@ -195,8 +308,66 @@ mod tests {
     fn non_relational_types_never_have_a_comodel() {
         assert_eq!(
             read("fields.Selection('_selection_values')"),
-            declared(FieldType::Selection, Comodel::Absent)
+            with_attrs(
+                FieldType::Selection,
+                Comodel::Absent,
+                FieldAttrs {
+                    selection: Written::Unreadable,
+                    ..FieldAttrs::default()
+                }
+            )
         );
+    }
+
+    #[test]
+    fn reads_the_arguments_that_decide_storage() {
+        let attrs = attrs_of("fields.Monetary(compute='_compute_total', store=True)");
+        assert_eq!(attrs.compute, Written::Value("_compute_total".to_string()));
+        assert_eq!(attrs.store, Written::Value(true));
+        assert_eq!(
+            attrs_of("fields.Char(compute=_compute_name)").compute,
+            Written::Value("_compute_name".to_string())
+        );
+        assert_eq!(
+            attrs_of("fields.Binary(attachment=False)").attachment,
+            Written::Value(false)
+        );
+        assert_eq!(
+            attrs_of("fields.Char(store=STORED)").store,
+            Written::Unreadable
+        );
+        assert_eq!(
+            attrs_of("fields.Char(compute=lambda self: None)").compute,
+            Written::Unreadable
+        );
+    }
+
+    #[test]
+    fn reads_selection_keys_from_either_place() {
+        assert_eq!(
+            attrs_of("fields.Selection([('draft', 'Draft'), ('done', 'Done')], default='draft')")
+                .selection,
+            keys(&["draft", "done"])
+        );
+        assert_eq!(
+            attrs_of("fields.Selection(selection=[('a', 'A')])").selection,
+            keys(&["a"])
+        );
+        assert_eq!(
+            attrs_of("fields.Selection(selection_add=[('sent', 'Sent'), ('done',)])").selection_add,
+            keys(&["sent", "done"])
+        );
+        assert_eq!(
+            attrs_of("fields.Selection([(KEY, 'Label')])").selection,
+            Written::Unreadable
+        );
+    }
+
+    #[test]
+    fn keyword_splat_makes_unwritten_arguments_unreadable() {
+        let attrs = attrs_of("fields.Char(store=False, **COMMON)");
+        assert_eq!(attrs.store, Written::Value(false));
+        assert_eq!(attrs.compute, Written::Unreadable);
     }
 
     #[test]

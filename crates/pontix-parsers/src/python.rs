@@ -11,8 +11,8 @@ mod module_level;
 use std::path::Path;
 
 use pontix_core::{
-    Delegation, Diagnostic, DiagnosticKind, FieldDef, FieldName, Inherit, MethodDef, ModelDef,
-    ModelName,
+    Delegation, Diagnostic, DiagnosticKind, FieldDef, FieldName, Inherit, MethodDef, ModelBase,
+    ModelDef, ModelName, Written,
 };
 use ruff_python_ast::visitor::{Visitor, walk_stmt};
 use ruff_python_ast::{Expr, ExprList, ExprName, ExprTuple, Stmt, StmtClassDef};
@@ -171,6 +171,9 @@ impl Reader<'_> {
             name: None,
             inherit: Inherit::Absent,
             inherits: Vec::new(),
+            base: self.model_base(class),
+            auto: Written::Absent,
+            table_query: false,
             fields: Vec::new(),
             methods: Vec::new(),
             location: self.source.location(class.name.range.start()),
@@ -179,6 +182,12 @@ impl Reader<'_> {
         // Statements run top to bottom, so a later assignment replaces an
         // earlier one, and one we cannot read leaves the value unknown.
         for stmt in &class.body {
+            if let Some(table) = table_attribute(stmt) {
+                match table {
+                    Table::Auto(auto) => model.auto = auto,
+                    Table::Query => model.table_query = true,
+                }
+            }
             if let Stmt::FunctionDef(def) = stmt {
                 model.methods.push(MethodDef {
                     name: def.name.as_str().to_string(),
@@ -248,6 +257,7 @@ impl Reader<'_> {
         let Field::Declared {
             field_type,
             comodel,
+            attrs,
         } = declaration
         else {
             self.report(DiagnosticKind::UnrecognizedField, stmt.range());
@@ -266,8 +276,46 @@ impl Reader<'_> {
             name: FieldName::new(target.id.as_str()),
             field_type,
             comodel,
+            attrs,
             location: self.source.location(target.range.start()),
         });
+    }
+
+    /// The `odoo.models` class the model derives from, through its first
+    /// base that is one or a model class defined above in this file. A base
+    /// from another file leaves it unknown.
+    fn model_base(&self, class: &StmtClassDef) -> ModelBase {
+        let bases = class
+            .arguments
+            .as_deref()
+            .map(|arguments| arguments.args.iter())
+            .into_iter()
+            .flatten();
+        for base in bases {
+            if is_model_base(base) {
+                let name = match base {
+                    Expr::Name(name) => name.id.as_str(),
+                    Expr::Attribute(attribute) => attribute.attr.as_str(),
+                    _ => continue,
+                };
+                return match name {
+                    "Model" => ModelBase::Model,
+                    "TransientModel" => ModelBase::Transient,
+                    _ => ModelBase::Abstract,
+                };
+            }
+            if let Expr::Name(name) = base
+                && let Some(model) = self
+                    .out
+                    .models
+                    .iter()
+                    .rev()
+                    .find(|model| model.class_name == name.id.as_str())
+            {
+                return model.base;
+            }
+        }
+        ModelBase::Unknown
     }
 
     /// A base written as the name of a model class defined earlier in this
@@ -337,6 +385,35 @@ impl<'s> Visitor<'s> for NestedClasses<'_, '_> {
             Stmt::FunctionDef(_) => {}
             other => walk_stmt(self, other),
         }
+    }
+}
+
+/// A class body statement that decides whether the model has a table.
+enum Table {
+    /// `_auto = ...`.
+    Auto(Written<bool>),
+    /// `_table_query = ...`, or `_table_query` defined as a method or
+    /// property.
+    Query,
+}
+
+fn table_attribute(stmt: &Stmt) -> Option<Table> {
+    let (target, value) = match stmt {
+        Stmt::FunctionDef(def) if def.name.as_str() == "_table_query" => return Some(Table::Query),
+        Stmt::Assign(assign) => (assign.targets.first()?, Some(&*assign.value)),
+        Stmt::AnnAssign(assign) => (&*assign.target, assign.value.as_deref()),
+        _ => return None,
+    };
+    let Expr::Name(name) = target else {
+        return None;
+    };
+    match (name.id.as_str(), value) {
+        ("_auto", Some(Expr::BooleanLiteral(literal))) => {
+            Some(Table::Auto(Written::Value(literal.value)))
+        }
+        ("_auto", Some(_)) => Some(Table::Auto(Written::Unreadable)),
+        ("_table_query", Some(_)) => Some(Table::Query),
+        _ => None,
     }
 }
 
@@ -537,6 +614,53 @@ mod tests {
         ]);
         let classes: Vec<&str> = file.models.iter().map(|m| m.class_name.as_str()).collect();
         assert_eq!(classes, ["A", "B", "C", "D", "E", "F", "G"]);
+    }
+
+    #[test]
+    fn the_base_and_table_attributes_decide_the_table() {
+        let file = parse(&[
+            "class A(models.Model): pass",
+            "class B(models.AbstractModel): pass",
+            "class C(models.TransientModel): pass",
+            "class D(B): pass",
+            "class Report(models.Model):",
+            "    _auto = False",
+            "class Query(models.Model):",
+            "    @property",
+            "    def _table_query(self):",
+            "        return 'SELECT 1'",
+            "class Flag(models.Model):",
+            "    _auto = AUTO",
+        ]);
+        let tables: Vec<(ModelBase, Written<bool>, bool)> = file
+            .models
+            .iter()
+            .map(|model| (model.base, model.auto.clone(), model.table_query))
+            .collect();
+        assert_eq!(
+            tables,
+            [
+                (ModelBase::Model, Written::Absent, false),
+                (ModelBase::Abstract, Written::Absent, false),
+                (ModelBase::Transient, Written::Absent, false),
+                (ModelBase::Abstract, Written::Absent, false),
+                (ModelBase::Model, Written::Value(false), false),
+                (ModelBase::Model, Written::Absent, true),
+                (ModelBase::Model, Written::Unreadable, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn fields_keep_the_arguments_that_decide_storage() {
+        let file = parse(&[
+            "class Order(models.Model):",
+            "    _name = 'sale.order'",
+            "    amount = fields.Monetary(compute='_compute_amount', store=True)",
+        ]);
+        let attrs = &file.models[0].fields[0].attrs;
+        assert_eq!(attrs.compute, Written::Value("_compute_amount".to_string()));
+        assert_eq!(attrs.store, Written::Value(true));
     }
 
     #[test]

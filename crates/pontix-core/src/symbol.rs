@@ -75,6 +75,62 @@ impl fmt::Display for FieldName {
     }
 }
 
+/// A value as the source writes it: not given, a literal Pontix reads, or
+/// something it cannot know without running the code, such as
+/// `store=STORE_FIELDS` or `selection="_selection_target_model"`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Written<T> {
+    /// Not given, so Odoo's default applies.
+    #[default]
+    Absent,
+    /// Given as a literal.
+    Value(T),
+    /// Given, but not as a literal Pontix can read.
+    Unreadable,
+}
+
+impl<T> Written<T> {
+    /// Whether the source gives the value at all, readable or not.
+    pub fn is_given(&self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+}
+
+/// The field arguments that decide whether and how the field's values are
+/// stored, as one declaration writes them. A redefinition only writes the
+/// arguments it changes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FieldAttrs {
+    /// `store=`.
+    pub store: Written<bool>,
+    /// `compute=`, as the method name when written as a string or a name.
+    pub compute: Written<String>,
+    /// `related=`, the dotted path.
+    pub related: Written<String>,
+    /// `attachment=`, for `Binary` and `Image` fields.
+    pub attachment: Written<bool>,
+    /// The keys of `selection=` (or the first positional argument of a
+    /// `Selection` field) when written as a list of pairs.
+    pub selection: Written<Vec<String>>,
+    /// The keys `selection_add=` adds, in order.
+    pub selection_add: Written<Vec<String>>,
+}
+
+/// The class from `odoo.models` a model class derives from, which decides
+/// whether the model gets a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelBase {
+    /// `models.Model`: a table.
+    Model,
+    /// `models.TransientModel`: a table whose rows Odoo cleans up.
+    Transient,
+    /// `models.AbstractModel` or `models.BaseModel`: no table of its own.
+    Abstract,
+    /// A base defined in another file, which Pontix does not follow.
+    #[default]
+    Unknown,
+}
+
 /// A field declared on a model, for example `partner_id = fields.Many2one("res.partner")`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDef {
@@ -87,6 +143,8 @@ pub struct FieldDef {
     /// redefinition `fields.Many2one(ondelete="cascade")` that keeps the
     /// comodel of the field it overrides.
     pub comodel: Option<ModelName>,
+    /// The arguments that decide how it is stored.
+    pub attrs: FieldAttrs,
     /// Where the field is declared.
     pub location: Location,
 }
@@ -155,8 +213,16 @@ pub struct ModelDef {
     pub name: Option<ModelName>,
     /// Value of `_inherit`, as written.
     pub inherit: Inherit,
-    /// Entries of `_inherit` (delegation inheretence), in declaration order.
+    /// Entries of `_inherits` (delegation inheritance), in declaration order.
     pub inherits: Vec<Delegation>,
+    /// The `odoo.models` class it derives from.
+    pub base: ModelBase,
+    /// Value of `_auto`, which turns the table off (`False`) for a model
+    /// that would otherwise have one, such as an SQL view report.
+    pub auto: Written<bool>,
+    /// Whether the class sets `_table_query`, as an attribute or a property:
+    /// the model reads its rows from a query and has no table.
+    pub table_query: bool,
     /// Fields declared in the class body, in declaration order.
     pub fields: Vec<FieldDef>,
     /// Methods defined in the class body, in declaration order.
@@ -194,6 +260,7 @@ mod tests {
             name: FieldName::new(name),
             field_type: FieldType::Char,
             comodel: None,
+            attrs: FieldAttrs::default(),
             location: Location::new("models/test.py", line(at_line)),
         }
     }
@@ -223,6 +290,9 @@ mod tests {
             name: None,
             inherit: Inherit::Single(ModelName::new("sale.order.line")),
             inherits: vec![],
+            base: ModelBase::Model,
+            auto: Written::Absent,
+            table_query: false,
             fields: vec![
                 char_field("customer_ref", 8),
                 char_field("customer_ref", 12),
