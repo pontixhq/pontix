@@ -1,6 +1,8 @@
-//! Symbols extracted from Odoo source code: models, fields, and methods.
+//! Symbols extracted from Odoo source code, exactly as written: models,
+//! fields and methods. Version-specific Odoo rules live in [`crate::resolve`].
 
 use std::fmt;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 /// A position in a source file.
@@ -9,12 +11,12 @@ pub struct Location {
     /// Path of the file, relative to the addons folder it was read from.
     pub file: PathBuf,
     /// Line number, starting at 1.
-    pub line: u32,
+    pub line: NonZeroU32,
 }
 
 impl Location {
-    /// Creates a location from a file path and a 1-based line number.
-    pub fn new(file: impl Into<PathBuf>, line: u32) -> Self {
+    /// Creates a location from a file path and a line number.
+    pub fn new(file: impl Into<PathBuf>, line: NonZeroU32) -> Self {
         Self {
             file: file.into(),
             line,
@@ -50,7 +52,7 @@ impl fmt::Display for ModelName {
     }
 }
 
-/// Name of a field on a mode, for example `product_uom_id`.
+/// Name of a field on a model, for example `product_uom_id`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldName(String);
 
@@ -72,14 +74,14 @@ impl fmt::Display for FieldName {
     }
 }
 
-/// A field declared on a model, for example `partner_id = fields.Many2One("res.partner")`.
+/// A field declared on a model, for example `partner_id = fields.Many2one("res.partner")`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDef {
     /// Field name.
     pub name: FieldName,
-    /// Field type as written after `fields.`, for example `Many2One`.
+    /// Field type as written after `fields.`, for example `Many2one`.
     pub field_type: String,
-    /// Target model of a relational field (`Many2One`, `One2Many`, `Many2Many`).
+    /// Target model of a relational field (`Many2one`, `One2many`, `Many2many`).
     pub comodel: Option<ModelName>,
     /// Where the field is declared.
     pub location: Location,
@@ -98,33 +100,61 @@ pub struct MethodDef {
     pub location: Location,
 }
 
-/// A model class: a new model (`_name`) or an extension of one (`_inherit`).
+/// How `_inherit` is written in a class body. The string form and the list
+/// form are kept apart because Odoo 19 treats them differently when `_name`
+/// is missing (see [`crate::resolve::model_name`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Inherit {
+    /// No `_inherit` attribute.
+    #[default]
+    Absent,
+    /// `_inherit = "sale.order"`.
+    Single(ModelName),
+    /// `_inherit = ["mail.thread", "mail.activity.mixin"]`, even with one item.
+    List(Vec<ModelName>),
+}
+
+impl Inherit {
+    /// Parent model names in declaration order.
+    pub fn parents(&self) -> &[ModelName] {
+        match self {
+            Self::Absent => &[],
+            Self::Single(parent) => std::slice::from_ref(parent),
+            Self::List(parents) => parents,
+        }
+    }
+}
+
+/// A model class as written in Python.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDef {
     /// Python class name.
     pub class_name: String,
     /// Value of `_name`, when the class sets it.
     pub name: Option<ModelName>,
-    /// Value of `_inherit`; a single string becomes a list of one.
-    pub inherit: Vec<ModelName>,
-    /// Fields declared in the class body.
+    /// Value of `_inherit`, as written.
+    pub inherit: Inherit,
+    /// Fields declared in the class body, in declaration order.
     pub fields: Vec<FieldDef>,
-    /// Methods defined in the class body.
+    /// Methods defined in the class body, in declaration order.
     pub methods: Vec<MethodDef>,
     /// Where the class is defined.
     pub location: Location,
 }
 
 impl ModelDef {
-    /// The model this class defines or extends: `_name` when set,
-    /// otherwise the first `_inherit`.
-    pub fn target(&self) -> Option<&ModelName> {
-        self.name.as_ref().or_else(|| self.inherit.first())
+    /// Parent models listed in `_inherit`, in declaration order.
+    pub fn parents(&self) -> &[ModelName] {
+        self.inherit.parents()
     }
 
-    /// Finds a field declared in this class by name.
+    /// Finds a field declared in this class by name. When the class body
+    /// declares the same name more than once, the last declaration wins, as in Python.
     pub fn field(&self, name: &str) -> Option<&FieldDef> {
-        self.fields.iter().find(|field| field.name.as_str() == name)
+        self.fields
+            .iter()
+            .rev()
+            .find(|field| field.name.as_str() == name)
     }
 }
 
@@ -132,49 +162,54 @@ impl ModelDef {
 mod tests {
     use super::*;
 
-    fn sale_line_extension() -> ModelDef {
-        ModelDef {
-            class_name: "SaleOrderLine".to_string(),
-            name: None,
-            inherit: vec![ModelName::new("sale.order.line")],
-            fields: vec![FieldDef {
-                name: FieldName::new("customer_ref"),
-                field_type: "Char".to_string(),
-                comodel: None,
-                location: Location::new("models/sale_order_line.py", 8),
-            }],
-            methods: vec![],
-            location: Location::new("models/sale_order_line.py", 5),
+    fn line(number: u32) -> NonZeroU32 {
+        NonZeroU32::new(number).expect("test line numbers start at 1")
+    }
+
+    fn char_field(name: &str, at_line: u32) -> FieldDef {
+        FieldDef {
+            name: FieldName::new(name),
+            field_type: "Char".to_string(),
+            comodel: None,
+            location: Location::new("models/test.py", line(at_line)),
         }
     }
 
     #[test]
-    fn location_display_as_file_and_line() {
-        let location = Location::new("models/sale_order.py", 42);
+    fn location_displays_as_file_and_line() {
+        let location = Location::new("models/sale_order.py", line(42));
         assert_eq!(location.to_string(), "models/sale_order.py:42");
     }
 
     #[test]
-    fn target_is_inherit_when_name_is_missing() {
-        let model = sale_line_extension();
-        assert_eq!(model.target(), Some(&ModelName::new("sale.order.line")));
+    fn parents_of_every_inherit_form() {
+        assert!(Inherit::Absent.parents().is_empty());
+        let single = Inherit::Single(ModelName::new("sale.order"));
+        assert_eq!(single.parents(), &[ModelName::new("sale.order")]);
+        let list = Inherit::List(vec![
+            ModelName::new("mail.thread"),
+            ModelName::new("mail.activity.mixin"),
+        ]);
+        assert_eq!(list.parents().len(), 2);
     }
 
     #[test]
-    fn target_prefers_name_over_inherit() {
-        let mut model = sale_line_extension();
-        model.name = Some(ModelName::new("sale.order.line.custom"));
-        assert_eq!(
-            model.target(),
-            Some(&ModelName::new("sale.order.line.custom"))
-        );
-    }
-
-    #[test]
-    fn field_lookup_by_name() {
-        let model = sale_line_extension();
-        let field_type = model.field("customer_ref").map(|f| f.field_type.as_str());
-        assert_eq!(field_type, Some("Char"));
-        assert!(model.field("tax_id").is_none());
+    fn field_lookup_returns_last_declaration() {
+        let class = ModelDef {
+            class_name: "SaleOrderLine".to_string(),
+            name: None,
+            inherit: Inherit::Single(ModelName::new("sale.order.line")),
+            fields: vec![
+                char_field("customer_ref", 8),
+                char_field("customer_ref", 12),
+            ],
+            methods: vec![],
+            location: Location::new("models/test.py", line(5)),
+        };
+        let found_at = class
+            .field("customer_ref")
+            .map(|field| field.location.line.get());
+        assert_eq!(found_at, Some(12));
+        assert!(class.field("tax_id").is_none());
     }
 }
