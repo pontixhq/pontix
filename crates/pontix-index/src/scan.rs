@@ -17,6 +17,8 @@ pub struct Module {
     pub name: ModuleName,
     /// The module directory, under the addons path it was found in.
     pub path: PathBuf,
+    /// The manifest file Odoo reads for this module.
+    pub manifest_path: PathBuf,
     /// The manifest, as written.
     pub manifest: Manifest,
     /// Python files Odoo imports, in import order.
@@ -26,8 +28,10 @@ pub struct Module {
 }
 
 /// Every module found in a set of addons paths.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Addons {
+    /// The Odoo version whose rules found these modules.
+    pub version: OdooVersion,
     /// Modules, in addons-path order, then by name.
     pub modules: Vec<Module>,
     /// Everything that could not be read, across all modules.
@@ -38,7 +42,11 @@ pub struct Addons {
 /// directory directly inside an addons path holding a manifest file. When a
 /// name appears in several paths, the first one wins, as in Odoo.
 pub fn scan(addons_paths: &[PathBuf], version: OdooVersion) -> Addons {
-    let mut addons = Addons::default();
+    let mut addons = Addons {
+        version,
+        modules: Vec::new(),
+        diagnostics: Vec::new(),
+    };
     let mut seen = HashSet::new();
     for addons_path in addons_paths {
         let root = match Root::new(addons_path) {
@@ -110,6 +118,7 @@ fn scan_module(
     addons.modules.push(Module {
         name,
         path: dir.to_path_buf(),
+        manifest_path,
         manifest,
         python_files: loaded.files,
         models: loaded.models,

@@ -49,6 +49,27 @@ pub enum DiagnosticKind {
     /// A module with the same name was already found in an earlier addons
     /// path. Odoo uses the first one; this one is ignored.
     DuplicateModule,
+    /// The manifest sets `installable` to `False`.
+    NotInstallable,
+    /// The manifest `version` is not a version Odoo accepts. The snippet is
+    /// the version as written.
+    InvalidVersion,
+    /// The manifest `version` belongs to another Odoo series, for example
+    /// `18.0.1.0.0` on Odoo 19, which then treats the module as not
+    /// installable with only a log warning. The snippet is the version.
+    OtherSeriesVersion,
+    /// `auto_install` lists a module that is not in `depends`. The snippet is
+    /// that module.
+    InvalidAutoInstall,
+    /// A module in `depends` is not in any addons path. The snippet is that
+    /// module.
+    MissingDependency,
+    /// A module in `depends` cannot be installed itself. The snippet is that
+    /// module.
+    DependencyNotInstallable,
+    /// `depends` leads back to this module. The snippet is the dependency
+    /// that closes the loop.
+    DependencyCycle,
 }
 
 /// Something a parser could not read, with the source text exactly as written.
@@ -58,7 +79,9 @@ pub struct Diagnostic {
     pub kind: DiagnosticKind,
     /// Where it is.
     pub location: Location,
-    /// The source text exactly as written, unchanged. Empty for a diagnostic
-    /// about a whole file or directory, whose location is then its line 1.
+    /// The source text exactly as written, unchanged. For a diagnostic about
+    /// a whole file or directory, whose location is then its line 1, it is
+    /// empty or holds the value at fault as written (a module name, a
+    /// version).
     pub snippet: String,
 }

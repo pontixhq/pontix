@@ -10,14 +10,16 @@ pub mod field_type;
 pub mod manifest;
 pub mod resolve;
 pub mod symbol;
+pub mod version;
 
 pub use diagnostic::{Diagnostic, DiagnosticKind};
 pub use field_type::FieldType;
 pub use manifest::{AutoInstall, Manifest, ModuleName};
-pub use resolve::{ModelKind, OdooVersion};
+pub use resolve::ModelKind;
 pub use symbol::{
     Delegation, FieldDef, FieldName, Inherit, Location, MethodDef, ModelDef, ModelName,
 };
+pub use version::OdooVersion;
 
 /// Version of the Pontix core crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

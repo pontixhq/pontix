@@ -7,27 +7,7 @@
 use std::borrow::Cow;
 
 use crate::symbol::{Inherit, ModelDef, ModelName};
-
-/// Odoo versions whose rules Pontix knows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[non_exhaustive]
-pub enum OdooVersion {
-    /// Odoo 18.0.
-    V18,
-    /// Odoo 19.0.
-    V19,
-}
-
-impl OdooVersion {
-    /// Manifest file names this version looks for in a module directory, in
-    /// the order it tries them. Odoo 19 dropped `__openerp__.py`.
-    pub fn manifest_file_names(self) -> &'static [&'static str] {
-        match self {
-            Self::V18 => &["__manifest__.py", "__openerp__.py"],
-            Self::V19 => &["__manifest__.py"],
-        }
-    }
-}
+use crate::version::OdooVersion;
 
 /// How a model class relates to existing models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

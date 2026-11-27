@@ -1,4 +1,5 @@
-//! Finds Odoo modules in addons paths and reads what Odoo would load.
+//! Finds Odoo modules in addons paths, reads what Odoo would load from them,
+//! and works out which modules an installation holds and in what order.
 //!
 //! Only files Odoo actually imports are read: the chain of imports starting
 //! at each module's `__init__.py`. A Python file that nothing imports never
@@ -9,9 +10,12 @@
 //! [`MAX_FILE_SIZE`] are not read.
 #![forbid(unsafe_code)]
 
+mod effective;
 mod files;
+mod install;
 mod load;
 mod scan;
 
 pub use files::MAX_FILE_SIZE;
+pub use install::{Installation, ModelRef, install};
 pub use scan::{Addons, Module, scan};

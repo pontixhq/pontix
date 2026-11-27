@@ -79,6 +79,7 @@ fn read_key(manifest: &mut Manifest, key: &Expr, value: &Expr) -> Option<()> {
         "installable" => manifest.installable = Some(boolean(value)?),
         "auto_install" => manifest.auto_install = auto_install(value)?,
         "external_dependencies" => manifest.external_python = external_python(value)?,
+        "countries" => manifest.countries = strings(value)?.map(str::to_string).collect(),
         _ => {}
     }
     Some(())
@@ -222,6 +223,7 @@ mod tests {
             "    'installable': True,",
             "    'auto_install': ['sale'],",
             "    'external_dependencies': {'python': ['openupgradelib'], 'bin': ['wkhtmltopdf']},",
+            "    'countries': ['id'],",
             "}",
         ]);
         assert!(file.diagnostics.is_empty(), "{:?}", file.diagnostics);
@@ -238,6 +240,7 @@ mod tests {
                 installable: Some(true),
                 auto_install: AutoInstall::When(modules(&["sale"])),
                 external_python: vec!["openupgradelib".to_string()],
+                countries: vec!["id".to_string()],
             })
         );
     }

@@ -58,4 +58,7 @@ pub struct Manifest {
     pub auto_install: AutoInstall,
     /// `external_dependencies["python"]`: Python requirements, as written.
     pub external_python: Vec<String>,
+    /// `countries`: country codes, as written. An `auto_install` module with
+    /// countries is only installed for a company in one of them.
+    pub countries: Vec<String>,
 }
