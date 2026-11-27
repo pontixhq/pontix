@@ -14,10 +14,10 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::path::Path;
 
-use pontix_core::{Change, ChangeSet, Location, ModelName};
+use pontix_core::{Change, ChangeSet, FieldName, Location, ModelName};
 use pontix_index::Installation;
 
-use crate::view::{ModelView, models};
+use crate::view::{FieldView, MethodView, ModelView, models};
 
 /// Every change between `source` and `target`, ordered by module, then by
 /// model, then by field and method name.
@@ -70,64 +70,59 @@ fn diff_model(
     new: &ModelView<'_>,
     changes: &mut Vec<Change>,
 ) {
+    // A mixin brings many methods at once, so a parent that comes or goes is
+    // one change rather than one per method.
+    for parent in new.parents.difference(&old.parents) {
+        changes.push(Change::ParentAdded {
+            model: model.clone(),
+            parent: parent.clone(),
+            after: new.first.clone(),
+        });
+    }
+    for parent in old.parents.difference(&new.parents) {
+        changes.push(Change::ParentRemoved {
+            model: model.clone(),
+            parent: parent.clone(),
+            before: old.first.clone(),
+        });
+    }
+
     let fields: BTreeSet<_> = old
         .fields
         .keys()
+        .chain(old.inherited_fields.keys())
         .chain(new.fields.keys())
+        .chain(new.inherited_fields.keys())
         .copied()
         .collect();
     for field in fields {
-        match (old.fields.get(field), new.fields.get(field)) {
-            (Some(before), Some(after)) => {
-                if before.field_type != after.field_type {
-                    changes.push(Change::FieldTypeChanged {
-                        model: model.clone(),
-                        field: field.clone(),
-                        from: before.field_type.clone(),
-                        to: after.field_type.clone(),
-                        before: before.type_at.clone(),
-                        after: after.type_at.clone(),
-                    });
-                }
-                // An unnamed comodel is inherited from an earlier
-                // declaration, so only two named ones can be compared.
-                if let (Some((from, from_at)), Some((to, to_at))) = (before.comodel, after.comodel)
-                    && from != to
-                {
-                    changes.push(Change::FieldComodelChanged {
-                        model: model.clone(),
-                        field: field.clone(),
-                        from: from.clone(),
-                        to: to.clone(),
-                        before: from_at.clone(),
-                        after: to_at.clone(),
-                    });
-                }
-                if before.owner != after.owner {
-                    changes.push(Change::FieldMoved {
-                        model: model.clone(),
-                        field: field.clone(),
-                        from: before.owner.clone(),
-                        to: after.owner.clone(),
-                        before: before.first.clone(),
-                        after: after.first.clone(),
-                    });
-                }
-            }
+        if let (Some(before), Some(after)) = (old.fields.get(field), new.fields.get(field)) {
+            compare_field(model, field, before, after, changes);
+            continue;
+        }
+        // A field counts as there however the model reaches it: one that
+        // moved into a mixin or a delegated model is not removed. Fields only
+        // reached through delegation are reported on their own model.
+        match (old.field_location(field), new.field_location(field)) {
+            (Some(_), None) if new.reaches_field(field) => {}
+            (None, Some(_)) if old.reaches_field(field) => {}
             (Some(before), None) => changes.push(Change::FieldRemoved {
                 model: model.clone(),
                 field: field.clone(),
-                before: before.first.clone(),
+                before: before.clone(),
             }),
             (None, Some(after)) => changes.push(Change::FieldAdded {
                 model: model.clone(),
                 field: field.clone(),
-                after: after.first.clone(),
+                after: after.clone(),
             }),
-            (None, None) => {}
+            _ => {}
         }
     }
 
+    // Methods the model defines itself, in either version. One it only
+    // inherits is not reported: its parent model reports it, and a parent
+    // that comes or goes is reported above.
     let methods: BTreeSet<_> = old
         .methods
         .keys()
@@ -136,42 +131,99 @@ fn diff_model(
         .collect();
     for method in methods {
         match (old.methods.get(method), new.methods.get(method)) {
-            (Some(before), Some(after)) => {
-                if before.first.params != after.first.params {
-                    changes.push(Change::MethodParamsChanged {
-                        model: model.clone(),
-                        method: method.to_string(),
-                        from: before.first.params.clone(),
-                        to: after.first.params.clone(),
-                        before: before.first.location.clone(),
-                        after: after.first.location.clone(),
-                    });
-                }
-                for (module, old_def) in &before.by_module {
-                    if let Some(new_def) = after.by_module.get(module)
-                        && old_def.fingerprint != new_def.fingerprint
-                    {
-                        changes.push(Change::MethodBodyChanged {
-                            model: model.clone(),
-                            method: method.to_string(),
-                            module: (*module).clone(),
-                            before: old_def.location.clone(),
-                            after: new_def.location.clone(),
-                        });
-                    }
-                }
+            (Some(before), Some(after)) => compare_method(model, method, before, after, changes),
+            (Some(before), None) if !new.has_method(method) => {
+                changes.push(Change::MethodRemoved {
+                    model: model.clone(),
+                    method: method.to_string(),
+                    before: before.first.location.clone(),
+                });
             }
-            (Some(before), None) => changes.push(Change::MethodRemoved {
+            (None, Some(after)) if !old.has_method(method) => {
+                changes.push(Change::MethodAdded {
+                    model: model.clone(),
+                    method: method.to_string(),
+                    after: after.first.location.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Compares a field both versions declare on the model itself.
+fn compare_field(
+    model: &ModelName,
+    field: &FieldName,
+    before: &FieldView<'_>,
+    after: &FieldView<'_>,
+    changes: &mut Vec<Change>,
+) {
+    if before.field_type != after.field_type {
+        changes.push(Change::FieldTypeChanged {
+            model: model.clone(),
+            field: field.clone(),
+            from: before.field_type.clone(),
+            to: after.field_type.clone(),
+            before: before.type_at.clone(),
+            after: after.type_at.clone(),
+        });
+    }
+    // An unnamed comodel is inherited from an earlier declaration, so only
+    // two named ones can be compared.
+    if let (Some((from, from_at)), Some((to, to_at))) = (before.comodel, after.comodel)
+        && from != to
+    {
+        changes.push(Change::FieldComodelChanged {
+            model: model.clone(),
+            field: field.clone(),
+            from: from.clone(),
+            to: to.clone(),
+            before: from_at.clone(),
+            after: to_at.clone(),
+        });
+    }
+    if before.owner != after.owner {
+        changes.push(Change::FieldMoved {
+            model: model.clone(),
+            field: field.clone(),
+            from: before.owner.clone(),
+            to: after.owner.clone(),
+            before: before.first.clone(),
+            after: after.first.clone(),
+        });
+    }
+}
+
+/// Compares a method both versions define on the model itself.
+fn compare_method(
+    model: &ModelName,
+    method: &str,
+    before: &MethodView<'_>,
+    after: &MethodView<'_>,
+    changes: &mut Vec<Change>,
+) {
+    if before.first.params != after.first.params {
+        changes.push(Change::MethodParamsChanged {
+            model: model.clone(),
+            method: method.to_string(),
+            from: before.first.params.clone(),
+            to: after.first.params.clone(),
+            before: before.first.location.clone(),
+            after: after.first.location.clone(),
+        });
+    }
+    for (module, old_def) in &before.by_module {
+        if let Some(new_def) = after.by_module.get(module)
+            && old_def.fingerprint != new_def.fingerprint
+        {
+            changes.push(Change::MethodBodyChanged {
                 model: model.clone(),
                 method: method.to_string(),
-                before: before.first.location.clone(),
-            }),
-            (None, Some(after)) => changes.push(Change::MethodAdded {
-                model: model.clone(),
-                method: method.to_string(),
-                after: after.first.location.clone(),
-            }),
-            (None, None) => {}
+                module: (*module).clone(),
+                before: old_def.location.clone(),
+                after: new_def.location.clone(),
+            });
         }
     }
 }
@@ -676,6 +728,87 @@ mod tests {
         assert!(
             field_renames.contains(&("product.product", "packaging_ids", "product_uom_ids")),
             "{field_renames:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_fields_count_and_delegated_ones_stay_with_their_model() {
+        let mixin = |fields: Vec<FieldDef>| model("mail.thread", Inherit::Absent, fields, vec![]);
+        let with_mixin = |name: &str, own: Vec<FieldDef>| ModelDef {
+            name: Some(ModelName::new(name)),
+            inherit: Inherit::List(vec![ModelName::new("mail.thread")]),
+            ..model(name, Inherit::Absent, own, vec![])
+        };
+        let delegating = |fields: Vec<FieldDef>| ModelDef {
+            inherits: vec![pontix_core::Delegation {
+                parent: ModelName::new("res.partner"),
+                field: FieldName::new("partner_id"),
+            }],
+            ..model("res.users", Inherit::Absent, fields, vec![])
+        };
+        let source = vec![module(
+            "base",
+            &[],
+            vec![
+                mixin(vec![field(
+                    "message_ids",
+                    FieldType::One2many,
+                    Some("mail.message"),
+                    1,
+                )]),
+                with_mixin("maintenance.request", vec![]),
+                // `note` moves from the model into the mixin it inherits.
+                with_mixin("crm.lead", vec![field("note", FieldType::Html, None, 5)]),
+                model(
+                    "res.partner",
+                    Inherit::Absent,
+                    vec![field("fax", FieldType::Char, None, 7)],
+                    vec![],
+                ),
+                delegating(vec![]),
+            ],
+        )];
+        let target = vec![module(
+            "base",
+            &[],
+            vec![
+                mixin(vec![
+                    field("message_ids", FieldType::One2many, Some("mail.message"), 1),
+                    field("note", FieldType::Html, None, 2),
+                ]),
+                // No longer inherits the mixin.
+                model("maintenance.request", Inherit::Absent, vec![], vec![]),
+                with_mixin("crm.lead", vec![]),
+                model("res.partner", Inherit::Absent, vec![], vec![]),
+                delegating(vec![]),
+            ],
+        )];
+        let found = changes(source, target);
+        assert_eq!(
+            found,
+            [
+                Change::FieldAdded {
+                    model: name("mail.thread"),
+                    field: FieldName::new("note"),
+                    after: at("models.py", 2),
+                },
+                Change::ParentRemoved {
+                    model: name("maintenance.request"),
+                    parent: name("mail.thread"),
+                    before: at("models.py", 1),
+                },
+                Change::FieldRemoved {
+                    model: name("maintenance.request"),
+                    field: FieldName::new("message_ids"),
+                    before: at("models.py", 1),
+                },
+                // Reported once, on the model that owns it, not on `res.users`.
+                Change::FieldRemoved {
+                    model: name("res.partner"),
+                    field: FieldName::new("fax"),
+                    before: at("models.py", 7),
+                },
+            ]
         );
     }
 }

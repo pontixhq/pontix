@@ -138,6 +138,27 @@ pub enum Change {
         /// Its first definition in the target version.
         after: Location,
     },
+    /// The model inherits from another model it did not inherit from, such
+    /// as `mail.thread`, and so gains its fields and methods.
+    ParentAdded {
+        /// The model.
+        model: ModelName,
+        /// The model it now inherits from.
+        parent: ModelName,
+        /// The model's first definition in the target version.
+        after: Location,
+    },
+    /// The model no longer inherits from a model, and loses the fields and
+    /// methods it had only from there (`message_post` when it drops
+    /// `mail.thread`).
+    ParentRemoved {
+        /// The model.
+        model: ModelName,
+        /// The model it no longer inherits from.
+        parent: ModelName,
+        /// The model's first definition in the source version.
+        before: Location,
+    },
     /// A field no definition of its model declares any more.
     FieldRemoved {
         /// The model.
@@ -261,6 +282,8 @@ impl Change {
             Self::ModuleRemoved { .. } => None,
             Self::ModelRemoved { model, .. }
             | Self::ModelAdded { model, .. }
+            | Self::ParentAdded { model, .. }
+            | Self::ParentRemoved { model, .. }
             | Self::FieldRemoved { model, .. }
             | Self::FieldAdded { model, .. }
             | Self::FieldTypeChanged { model, .. }
