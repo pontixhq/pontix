@@ -418,23 +418,23 @@ fn string(expr: &Expr) -> Option<&str> {
     }
 }
 
-/// A string, or a list or tuple whose items are all strings. `_name` refers
-/// to the value assigned to `_name` above it in the same class body, as in
-/// `_inherit = _name` (`website/models/ir_module_module.py`, Odoo 18).
+/// A string, or a list or tuple whose items are all strings. `_name`, alone
+/// or as a list item, refers to the value assigned to `_name` above it in the
+/// same class body: `_inherit = _name` (`website/models/ir_module_module.py`,
+/// Odoo 18) and `_inherit = [_name, "stock.invoice.state.mixin"]`
+/// (`stock_picking_invoicing`, OCA 19.0).
 fn inherit(expr: &Expr, name: Option<&ModelName>) -> Option<Inherit> {
+    let model_name = |item: &Expr| match item {
+        Expr::Name(reference) if reference.id.as_str() == "_name" => name.cloned(),
+        other => string(other).map(ModelName::new),
+    };
     match expr {
-        Expr::Name(reference) if reference.id.as_str() == "_name" => {
-            name.cloned().map(Inherit::Single)
-        }
-        Expr::StringLiteral(literal) => {
-            Some(Inherit::Single(ModelName::new(literal.value.to_str())))
-        }
         Expr::List(ExprList { elts, .. }) | Expr::Tuple(ExprTuple { elts, .. }) => elts
             .iter()
-            .map(|item| string(item).map(ModelName::new))
+            .map(model_name)
             .collect::<Option<Vec<_>>>()
             .map(Inherit::List),
-        _ => None,
+        single => model_name(single).map(Inherit::Single),
     }
 }
 
@@ -599,6 +599,23 @@ mod tests {
         assert_eq!(file.models[1].inherit, Inherit::Absent);
         assert_eq!(file.diagnostics.len(), 1);
         assert_eq!(file.diagnostics[0].snippet, "_inherit = _name");
+    }
+
+    #[test]
+    fn inherit_lists_may_name_the_model_itself() {
+        let file = parse(&[
+            "class StockMove(models.Model):",
+            "    _name = 'stock.move'",
+            "    _inherit = [",
+            "        _name,",
+            "        'stock.invoice.state.mixin',",
+            "    ]",
+        ]);
+        assert_eq!(
+            only_model(&file).inherit,
+            Inherit::List(vec![name("stock.move"), name("stock.invoice.state.mixin")])
+        );
+        assert!(file.diagnostics.is_empty());
     }
 
     #[test]
