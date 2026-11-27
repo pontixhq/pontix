@@ -1,6 +1,7 @@
 //! Symbols extracted from Odoo source code, exactly as written: models,
 //! fields and methods. Version-specific Odoo rules live in [`crate::resolve`].
 
+use crate::field_type::FieldType;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -80,7 +81,7 @@ pub struct FieldDef {
     /// Field name.
     pub name: FieldName,
     /// Field type as written after `fields.`, for example `Many2one`.
-    pub field_type: String,
+    pub field_type: FieldType,
     /// Target model of a relational field (`Many2one`, `One2many`, `Many2many`).
     pub comodel: Option<ModelName>,
     /// Where the field is declared.
@@ -125,6 +126,16 @@ impl Inherit {
     }
 }
 
+/// One `_inherits` entry: the parent model and the `Many2one` field that links
+/// to it, for example `{"res.partner": "partner_id"}` on `res.users`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delegation {
+    /// The model whose fields are delegated.
+    pub parent: ModelName,
+    /// The `Many2one` field pointing to the parent record.
+    pub field: FieldName,
+}
+
 /// A model class as written in Python.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDef {
@@ -134,6 +145,8 @@ pub struct ModelDef {
     pub name: Option<ModelName>,
     /// Value of `_inherit`, as written.
     pub inherit: Inherit,
+    /// Entries of `_inherit` (delegation inheretence), in declaration order.
+    pub inherits: Vec<Delegation>,
     /// Fields declared in the class body, in declaration order.
     pub fields: Vec<FieldDef>,
     /// Methods defined in the class body, in declaration order.
@@ -169,7 +182,7 @@ mod tests {
     fn char_field(name: &str, at_line: u32) -> FieldDef {
         FieldDef {
             name: FieldName::new(name),
-            field_type: "Char".to_string(),
+            field_type: FieldType::Char,
             comodel: None,
             location: Location::new("models/test.py", line(at_line)),
         }
@@ -199,6 +212,7 @@ mod tests {
             class_name: "SaleOrderLine".to_string(),
             name: None,
             inherit: Inherit::Single(ModelName::new("sale.order.line")),
+            inherits: vec![],
             fields: vec![
                 char_field("customer_ref", 8),
                 char_field("customer_ref", 12),

@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.98"
 authors = ["Rifyat Chaesa Kaffarozi"]
 repository = "https://github.com/pontixhq/pontix"
 publish = false

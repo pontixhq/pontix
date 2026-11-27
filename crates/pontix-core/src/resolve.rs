@@ -97,6 +97,7 @@ mod tests {
             class_name: class_name.to_string(),
             name: name.map(ModelName::new),
             inherit,
+            inherits: vec![],
             fields: vec![],
             methods: vec![],
             location: Location::new("models/test.py", NonZeroU32::MIN),

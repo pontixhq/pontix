@@ -5,11 +5,17 @@
 //! two Odoo versions, and the findings reported to users (PTX codes).
 #![forbid(unsafe_code)]
 
+pub mod diagnostic;
+pub mod field_type;
 pub mod resolve;
 pub mod symbol;
 
+pub use diagnostic::{Diagnostic, DiagnosticKind};
+pub use field_type::FieldType;
 pub use resolve::{ModelKind, OdooVersion};
-pub use symbol::{FieldDef, FieldName, Inherit, Location, MethodDef, ModelDef, ModelName};
+pub use symbol::{
+    Delegation, FieldDef, FieldName, Inherit, Location, MethodDef, ModelDef, ModelName,
+};
 
 /// Version of the Pontix core crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
