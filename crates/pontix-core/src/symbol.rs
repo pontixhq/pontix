@@ -101,6 +101,12 @@ pub struct MethodDef {
     pub params: Vec<String>,
     /// True when the method body calls `super()`.
     pub calls_super: bool,
+    /// What the method does, as a fingerprint of its decorators, parameter
+    /// names and defaults, and body. Formatting, comments, the docstring and
+    /// type annotations do not count. Two definitions with the same
+    /// fingerprint run the same code of their own. Only comparable within
+    /// one run of Pontix: it is never stored.
+    pub fingerprint: u64,
     /// Where the method is defined.
     pub location: Location,
 }

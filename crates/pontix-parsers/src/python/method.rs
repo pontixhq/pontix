@@ -1,5 +1,8 @@
 //! Method definitions in a model class body.
 
+use std::hash::{Hash, Hasher};
+
+use ruff_python_ast::comparable::{ComparableExpr, ComparableStmt};
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{Expr, Stmt, StmtFunctionDef};
 
@@ -41,6 +44,75 @@ pub(super) fn calls_super(def: &StmtFunctionDef) -> bool {
     let mut finder = SuperFinder { found: false };
     finder.visit_body(&def.body);
     finder.found
+}
+
+/// A fingerprint of what the method does: its decorators, parameter names
+/// with their default values, and body. Positions, formatting and comments
+/// are not in the syntax tree; the docstring and type annotations are
+/// skipped because they do not change behavior.
+pub(super) fn fingerprint(def: &StmtFunctionDef) -> u64 {
+    let mut hasher = Fnv1a::default();
+    def.is_async.hash(&mut hasher);
+    for decorator in &def.decorator_list {
+        ComparableExpr::from(decorator).hash(&mut hasher);
+    }
+    let parameters = &def.parameters;
+    for parameter in parameters
+        .posonlyargs
+        .iter()
+        .chain(&parameters.args)
+        .chain(&parameters.kwonlyargs)
+    {
+        parameter.parameter.name.as_str().hash(&mut hasher);
+        parameter
+            .default()
+            .map(ComparableExpr::from)
+            .hash(&mut hasher);
+    }
+    // Where each kind of parameter ends, so `a, *b` and `a, b` differ.
+    parameters.posonlyargs.len().hash(&mut hasher);
+    parameters.args.len().hash(&mut hasher);
+    parameters
+        .vararg
+        .as_ref()
+        .map(|parameter| parameter.name.as_str())
+        .hash(&mut hasher);
+    parameters
+        .kwarg
+        .as_ref()
+        .map(|parameter| parameter.name.as_str())
+        .hash(&mut hasher);
+    let body = match def.body.split_first() {
+        Some((Stmt::Expr(first), rest)) if matches!(*first.value, Expr::StringLiteral(_)) => rest,
+        _ => &def.body[..],
+    };
+    for stmt in body {
+        ComparableStmt::from(stmt).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// FNV-1a, 64 bits: a small hash with a fixed algorithm, unlike the
+/// standard library's default hasher, which may change between releases.
+struct Fnv1a(u64);
+
+impl Default for Fnv1a {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for Fnv1a {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 fn is_staticmethod(def: &StmtFunctionDef) -> bool {
@@ -145,5 +217,55 @@ mod tests {
             "    return [(r.id, r.name) for r in self]",
         ]);
         assert!(!calls_super(&plain));
+    }
+
+    fn fingerprint_of(lines: &[&str]) -> u64 {
+        fingerprint(&method(lines))
+    }
+
+    #[test]
+    fn fingerprint_ignores_what_does_not_change_behavior() {
+        let plain = fingerprint_of(&[
+            "@api.depends('order_line')",
+            "def _compute_total(self):",
+            "    for order in self:",
+            "        order.total = sum(order.order_line.mapped('price'))",
+        ]);
+        let reformatted = fingerprint_of(&[
+            "@api.depends(\"order_line\")",
+            "def _compute_total(self) -> None:",
+            "    \"\"\"Sum the lines.\"\"\"",
+            "    # one pass over the orders",
+            "    for order in self:",
+            "        order.total = sum(",
+            "            order.order_line.mapped(\"price\")",
+            "        )",
+        ]);
+        assert_eq!(plain, reformatted);
+    }
+
+    #[test]
+    fn fingerprint_changes_with_body_decorators_and_defaults() {
+        let base = fingerprint_of(&[
+            "@api.model",
+            "def run(self, check=True):",
+            "    return check",
+        ]);
+        for changed in [
+            fingerprint_of(&[
+                "@api.model",
+                "def run(self, check=True):",
+                "    return not check",
+            ]),
+            fingerprint_of(&["def run(self, check=True):", "    return check"]),
+            fingerprint_of(&[
+                "@api.model",
+                "def run(self, check=False):",
+                "    return check",
+            ]),
+            fingerprint_of(&["@api.model", "def run(self, *check):", "    return check"]),
+        ] {
+            assert_ne!(base, changed);
+        }
     }
 }

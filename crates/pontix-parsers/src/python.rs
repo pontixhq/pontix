@@ -184,6 +184,7 @@ impl Reader<'_> {
                     name: def.name.as_str().to_string(),
                     params: method::params(def),
                     calls_super: method::calls_super(def),
+                    fingerprint: method::fingerprint(def),
                     location: self.source.location(def.name.range.start()),
                 });
                 continue;
@@ -825,14 +826,14 @@ mod tests {
                 ),
             ]
         );
+        let method = &model.methods[0];
+        assert_eq!(model.methods.len(), 1);
+        assert_eq!(method.name, "action_confirm");
+        assert!(method.params.is_empty());
+        assert!(method.calls_super);
         assert_eq!(
-            model.methods,
-            [MethodDef {
-                name: "action_confirm".to_string(),
-                params: vec![],
-                calls_super: true,
-                location: Location::new(FILE, NonZeroU32::new(9).expect("nine is not zero")),
-            }]
+            method.location,
+            Location::new(FILE, NonZeroU32::new(9).expect("nine is not zero"))
         );
         assert!(file.diagnostics.is_empty());
     }
