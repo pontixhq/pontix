@@ -1,0 +1,573 @@
+//! Python source files: Odoo model classes and what they declare.
+//!
+//! Only module-level classes are read, because that is where Odoo defines
+//! models. Whatever cannot be read with certainty becomes a [`Diagnostic`]
+//! carrying the source text exactly as written.
+
+use std::num::NonZeroU32;
+use std::path::Path;
+
+use pontix_core::{
+    Delegation, Diagnostic, DiagnosticKind, FieldName, Inherit, Location, ModelDef, ModelName,
+};
+use ruff_python_ast::{Expr, ExprList, ExprTuple, Stmt, StmtClassDef};
+use ruff_python_parser::parse_module;
+use ruff_source_file::LineIndex;
+use ruff_text_size::{Ranged, TextRange, TextSize};
+
+/// Classes from `odoo.models` that make a subclass an Odoo model. Core uses
+/// `BaseModel` directly too, for example in `hr_skills` reports (Odoo 19).
+const MODEL_BASES: [&str; 4] = ["Model", "AbstractModel", "TransientModel", "BaseModel"];
+
+/// Class attributes that define a model's identity and inheritance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attribute {
+    Name,
+    Inherit,
+    Inherits,
+}
+
+const MODEL_ATTRIBUTES: [(&str, Attribute); 3] = [
+    ("_name", Attribute::Name),
+    ("_inherit", Attribute::Inherit),
+    ("_inherits", Attribute::Inherits),
+];
+
+/// What one Python file declares.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PythonFile {
+    /// Model classes, in source order.
+    pub models: Vec<ModelDef>,
+    /// Everything that could not be read, in source order.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Reads the Odoo models declared in one Python source file.
+///
+/// `file` is only recorded in locations; the file is never opened here.
+/// A file that is not valid Python yields a single
+/// [`DiagnosticKind::SyntaxError`] and no models, because Odoo cannot import it.
+pub fn parse_python(file: &Path, source: &str) -> PythonFile {
+    let mut reader = Reader {
+        file,
+        source,
+        lines: LineIndex::from_source_text(source),
+        out: PythonFile::default(),
+    };
+    match parse_module(source) {
+        Ok(parsed) => {
+            for stmt in &parsed.syntax().body {
+                if let Stmt::ClassDef(class) = stmt {
+                    reader.class(class);
+                }
+            }
+        }
+        Err(error) => reader.report_line(DiagnosticKind::SyntaxError, error.location.start()),
+    }
+    reader.out
+}
+
+/// One file being read; collects models and diagnostics as it goes.
+struct Reader<'a> {
+    file: &'a Path,
+    source: &'a str,
+    lines: LineIndex,
+    out: PythonFile,
+}
+
+impl Reader<'_> {
+    fn class(&mut self, class: &StmtClassDef) {
+        let is_model = class.arguments.as_deref().is_some_and(|arguments| {
+            arguments
+                .args
+                .iter()
+                .any(|base| is_model_base(base) || self.is_model_class_in_this_file(base))
+        });
+
+        if !is_model {
+            // A plain Python class is none of our business, unless it sets the
+            // attributes only a model uses: then its base is one we cannot see.
+            if class
+                .body
+                .iter()
+                .any(|stmt| model_attribute(stmt).is_some())
+            {
+                self.report_line(
+                    DiagnosticKind::UnrecognizedModelClass,
+                    class.name.range.start(),
+                );
+            }
+            return;
+        }
+
+        let mut model = ModelDef {
+            class_name: class.name.as_str().to_string(),
+            name: None,
+            inherit: Inherit::Absent,
+            inherits: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            location: self.location(class.name.range.start()),
+        };
+
+        // Statements run top to bottom, so a later assignment replaces an
+        // earlier one, and one we cannot read leaves the value unknown.
+        for stmt in &class.body {
+            let Some(assignment) = model_attribute(stmt) else {
+                continue;
+            };
+            match assignment.attribute {
+                Attribute::Name => {
+                    model.name = assignment.value.and_then(string).map(ModelName::new);
+                    if model.name.is_none() {
+                        self.report(DiagnosticKind::UnrecognizedName, assignment.range);
+                    }
+                }
+                Attribute::Inherit => match assignment
+                    .value
+                    .and_then(|value| inherit(value, model.name.as_ref()))
+                {
+                    Some(inherit) => model.inherit = inherit,
+                    None => {
+                        model.inherit = Inherit::Absent;
+                        self.report(DiagnosticKind::UnrecognizedInherit, assignment.range);
+                    }
+                },
+                Attribute::Inherits => match assignment.value.and_then(delegations) {
+                    Some(inherits) => model.inherits = inherits,
+                    None => {
+                        model.inherits.clear();
+                        self.report(DiagnosticKind::UnrecognizedInherits, assignment.range);
+                    }
+                },
+            }
+        }
+
+        self.out.models.push(model);
+    }
+
+    /// A base written as the name of a model class defined earlier in this
+    /// file, for example `class WebsitePublishedMultiMixin(WebsitePublishedMixin)`
+    /// in `website/models/mixins.py`. Python only sees classes defined above,
+    /// so earlier models are the only ones that count. Bases imported from
+    /// other files stay unrecognised here.
+    fn is_model_class_in_this_file(&self, base: &Expr) -> bool {
+        let Expr::Name(name) = base else {
+            return false;
+        };
+        self.out
+            .models
+            .iter()
+            .any(|model| model.class_name == name.id.as_str())
+    }
+
+    /// Reports the source text of `range`, exactly as written.
+    fn report(&mut self, kind: DiagnosticKind, range: TextRange) {
+        let snippet = self.source[range].to_string();
+        self.push(kind, range.start(), snippet);
+    }
+
+    /// Reports the whole line containing `offset`, without its line ending.
+    fn report_line(&mut self, kind: DiagnosticKind, offset: TextSize) {
+        let line = self
+            .lines
+            .line_range(self.lines.line_index(offset), self.source);
+        let snippet = self.source[line].trim_end_matches(['\r', '\n']).to_string();
+        self.push(kind, offset, snippet);
+    }
+
+    fn push(&mut self, kind: DiagnosticKind, offset: TextSize, snippet: String) {
+        let location = self.location(offset);
+        self.out.diagnostics.push(Diagnostic {
+            kind,
+            location,
+            snippet,
+        });
+    }
+
+    fn location(&self, offset: TextSize) -> Location {
+        // Saturates instead of failing: a source file cannot realistically
+        // have more than u32::MAX lines.
+        let line = u32::try_from(self.lines.line_index(offset).get())
+            .ok()
+            .and_then(NonZeroU32::new)
+            .unwrap_or(NonZeroU32::MAX);
+        Location::new(self.file, line)
+    }
+}
+
+/// An assignment to `_name`, `_inherit` or `_inherits` in a class body.
+struct ModelAttribute<'a> {
+    attribute: Attribute,
+    /// `None` when the statement changes the value in a way that cannot be
+    /// read statically, for example `_inherit += [...]`.
+    value: Option<&'a Expr>,
+    range: TextRange,
+}
+
+/// Recognises `x = ...`, `x: T = ...` and `x += ...` for the model attributes.
+/// An annotation without a value assigns nothing and is skipped.
+fn model_attribute(stmt: &Stmt) -> Option<ModelAttribute<'_>> {
+    let (attribute, value) = match stmt {
+        Stmt::Assign(assign) => (
+            assign.targets.iter().find_map(attribute_name)?,
+            Some(&*assign.value),
+        ),
+        Stmt::AnnAssign(assign) => (
+            attribute_name(&assign.target)?,
+            Some(assign.value.as_deref()?),
+        ),
+        Stmt::AugAssign(assign) => (attribute_name(&assign.target)?, None),
+        _ => return None,
+    };
+    Some(ModelAttribute {
+        attribute,
+        value,
+        range: stmt.range(),
+    })
+}
+
+fn attribute_name(target: &Expr) -> Option<Attribute> {
+    let Expr::Name(name) = target else {
+        return None;
+    };
+    MODEL_ATTRIBUTES
+        .into_iter()
+        .find_map(|(written, attribute)| (name.id.as_str() == written).then_some(attribute))
+}
+
+/// `models.Model`, `odoo.models.Model` or a bare `Model`, and the same for
+/// every other name in [`MODEL_BASES`].
+fn is_model_base(base: &Expr) -> bool {
+    match base {
+        Expr::Name(name) => MODEL_BASES.contains(&name.id.as_str()),
+        Expr::Attribute(attribute) => {
+            let from_models = match &*attribute.value {
+                Expr::Name(module) => module.id.as_str() == "models",
+                Expr::Attribute(module) => module.attr.as_str() == "models",
+                _ => false,
+            };
+            from_models && MODEL_BASES.contains(&attribute.attr.as_str())
+        }
+        _ => false,
+    }
+}
+
+/// A string literal, implicit concatenation included; nothing else.
+fn string(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::StringLiteral(literal) => Some(literal.value.to_str()),
+        _ => None,
+    }
+}
+
+/// A string, or a list or tuple whose items are all strings. `_name` refers
+/// to the value assigned to `_name` above it in the same class body, as in
+/// `_inherit = _name` (`website/models/ir_module_module.py`, Odoo 18).
+fn inherit(expr: &Expr, name: Option<&ModelName>) -> Option<Inherit> {
+    match expr {
+        Expr::Name(reference) if reference.id.as_str() == "_name" => {
+            name.cloned().map(Inherit::Single)
+        }
+        Expr::StringLiteral(literal) => {
+            Some(Inherit::Single(ModelName::new(literal.value.to_str())))
+        }
+        Expr::List(ExprList { elts, .. }) | Expr::Tuple(ExprTuple { elts, .. }) => elts
+            .iter()
+            .map(|item| string(item).map(ModelName::new))
+            .collect::<Option<Vec<_>>>()
+            .map(Inherit::List),
+        _ => None,
+    }
+}
+
+/// A dict literal whose keys and values are all strings. A repeated key keeps
+/// its first position and its last value, exactly as a Python dict does.
+fn delegations(expr: &Expr) -> Option<Vec<Delegation>> {
+    let Expr::Dict(dict) = expr else {
+        return None;
+    };
+    let mut entries: Vec<Delegation> = Vec::with_capacity(dict.items.len());
+    for item in &dict.items {
+        let parent = ModelName::new(string(item.key.as_ref()?)?);
+        let field = FieldName::new(string(&item.value)?);
+        match entries.iter_mut().find(|entry| entry.parent == parent) {
+            Some(entry) => entry.field = field,
+            None => entries.push(Delegation { parent, field }),
+        }
+    }
+    Some(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FILE: &str = "models/sale_order.py";
+
+    fn parse(lines: &[&str]) -> PythonFile {
+        parse_python(Path::new(FILE), &lines.join("\n"))
+    }
+
+    fn only_model(file: &PythonFile) -> &ModelDef {
+        assert_eq!(file.models.len(), 1, "expected one model: {file:?}");
+        &file.models[0]
+    }
+
+    fn name(value: &str) -> ModelName {
+        ModelName::new(value)
+    }
+
+    #[test]
+    fn reads_name_inherit_and_inherits() {
+        let file = parse(&[
+            "from odoo import fields, models",
+            "",
+            "",
+            "class ResUsers(models.Model):",
+            "    _name = 'res.users'",
+            "    _inherit = ['mail.thread', 'avatar.mixin']",
+            "    _inherits = {'res.partner': 'partner_id'}",
+        ]);
+        let model = only_model(&file);
+        assert_eq!(model.class_name, "ResUsers");
+        assert_eq!(model.name, Some(name("res.users")));
+        assert_eq!(
+            model.inherit,
+            Inherit::List(vec![name("mail.thread"), name("avatar.mixin")])
+        );
+        assert_eq!(
+            model.inherits,
+            [Delegation {
+                parent: name("res.partner"),
+                field: FieldName::new("partner_id"),
+            }]
+        );
+        assert_eq!(model.location.to_string(), format!("{FILE}:4"));
+        assert!(file.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn string_inherit_is_single_and_tuple_is_a_list() {
+        let file = parse(&[
+            "class A(models.Model):",
+            "    _inherit = 'sale.order'",
+            "class B(models.Model):",
+            "    _inherit = ('sale.order',)",
+        ]);
+        assert_eq!(file.models[0].inherit, Inherit::Single(name("sale.order")));
+        assert_eq!(
+            file.models[1].inherit,
+            Inherit::List(vec![name("sale.order")])
+        );
+    }
+
+    #[test]
+    fn recognises_every_model_base() {
+        let file = parse(&[
+            "class A(models.Model): pass",
+            "class B(models.AbstractModel): pass",
+            "class C(models.TransientModel): pass",
+            "class D(odoo.models.Model): pass",
+            "class E(Model): pass",
+            "class F(models.Model, SomeMixin): pass",
+            "class G(models.BaseModel): pass",
+        ]);
+        let classes: Vec<&str> = file.models.iter().map(|m| m.class_name.as_str()).collect();
+        assert_eq!(classes, ["A", "B", "C", "D", "E", "F", "G"]);
+    }
+
+    #[test]
+    fn a_model_class_defined_earlier_counts_as_a_base() {
+        let file = parse(&[
+            "class PublishedMixin(models.AbstractModel):",
+            "    _name = 'published.mixin'",
+            "class PublishedMultiMixin(PublishedMixin):",
+            "    _name = 'published.multi.mixin'",
+        ]);
+        let names: Vec<Option<&str>> = file
+            .models
+            .iter()
+            .map(|model| model.name.as_ref().map(ModelName::as_str))
+            .collect();
+        assert_eq!(
+            names,
+            [Some("published.mixin"), Some("published.multi.mixin")]
+        );
+        assert!(file.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn a_model_class_defined_later_does_not_count() {
+        let file = parse(&[
+            "class Early(Late):",
+            "    _name = 'early'",
+            "class Late(models.Model):",
+            "    _name = 'late'",
+        ]);
+        assert_eq!(only_model(&file).class_name, "Late");
+        assert_eq!(
+            file.diagnostics[0].kind,
+            DiagnosticKind::UnrecognizedModelClass
+        );
+    }
+
+    #[test]
+    fn annotated_assignment_is_read_and_bare_annotation_is_not() {
+        let file = parse(&[
+            "class A(models.Model):",
+            "    _name: str = 'a.model'",
+            "    _inherit: list",
+        ]);
+        let model = only_model(&file);
+        assert_eq!(model.name, Some(name("a.model")));
+        assert_eq!(model.inherit, Inherit::Absent);
+        assert!(file.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn inherit_may_refer_to_name_assigned_above() {
+        let file = parse(&[
+            "class A(models.Model):",
+            "    _name = 'ir.module.module'",
+            "    _inherit = _name",
+            "class B(models.Model):",
+            "    _inherit = _name",
+        ]);
+        assert_eq!(
+            file.models[0].inherit,
+            Inherit::Single(name("ir.module.module"))
+        );
+        assert_eq!(file.models[1].inherit, Inherit::Absent);
+        assert_eq!(file.diagnostics.len(), 1);
+        assert_eq!(file.diagnostics[0].snippet, "_inherit = _name");
+    }
+
+    #[test]
+    fn last_assignment_wins() {
+        let file = parse(&[
+            "class A(models.Model):",
+            "    _name = 'first'",
+            "    _name = 'second'",
+        ]);
+        assert_eq!(only_model(&file).name, Some(name("second")));
+    }
+
+    #[test]
+    fn repeated_inherits_key_keeps_its_last_value() {
+        let file = parse(&[
+            "class A(models.Model):",
+            "    _inherits = {'res.partner': 'old_id', 'res.company': 'company_id', 'res.partner': 'partner_id'}",
+        ]);
+        let fields: Vec<&str> = only_model(&file)
+            .inherits
+            .iter()
+            .map(|entry| entry.field.as_str())
+            .collect();
+        assert_eq!(fields, ["partner_id", "company_id"]);
+    }
+
+    #[test]
+    fn unreadable_values_are_reported_verbatim() {
+        let file = parse(&[
+            "class A(models.Model):",
+            "    _name = MODEL_NAME",
+            "    _inherit = [",
+            "        'mail.thread',",
+            "        BASE,",
+            "    ]",
+            "    _inherits = {**PARENTS}",
+            "    _inherit += ['x']",
+        ]);
+        let model = only_model(&file);
+        assert_eq!(model.name, None);
+        assert_eq!(model.inherit, Inherit::Absent);
+        assert!(model.inherits.is_empty());
+
+        let seen: Vec<(DiagnosticKind, String, &str)> = file
+            .diagnostics
+            .iter()
+            .map(|d| (d.kind, d.location.to_string(), d.snippet.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (
+                    DiagnosticKind::UnrecognizedName,
+                    format!("{FILE}:2"),
+                    "_name = MODEL_NAME"
+                ),
+                (
+                    DiagnosticKind::UnrecognizedInherit,
+                    format!("{FILE}:3"),
+                    "_inherit = [\n        'mail.thread',\n        BASE,\n    ]",
+                ),
+                (
+                    DiagnosticKind::UnrecognizedInherits,
+                    format!("{FILE}:7"),
+                    "_inherits = {**PARENTS}"
+                ),
+                (
+                    DiagnosticKind::UnrecognizedInherit,
+                    format!("{FILE}:8"),
+                    "_inherit += ['x']"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_later_unreadable_assignment_clears_the_earlier_value() {
+        let file = parse(&[
+            "class A(models.Model):",
+            "    _inherit = 'sale.order'",
+            "    _inherit = PARENT",
+        ]);
+        assert_eq!(only_model(&file).inherit, Inherit::Absent);
+        assert_eq!(file.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn plain_classes_are_ignored() {
+        let file = parse(&[
+            "class Helper:",
+            "    _cache = {}",
+            "class Wizard(models.Model):",
+            "    class Inner(models.Model):",
+            "        _name = 'not.module.level'",
+        ]);
+        assert_eq!(only_model(&file).class_name, "Wizard");
+        assert!(file.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn model_attributes_on_an_unknown_base_are_reported() {
+        let file = parse(&[
+            "class SaleOrder(CustomBase):",
+            "    _inherit = 'sale.order'",
+        ]);
+        assert!(file.models.is_empty());
+        assert_eq!(file.diagnostics.len(), 1);
+        let diagnostic = &file.diagnostics[0];
+        assert_eq!(diagnostic.kind, DiagnosticKind::UnrecognizedModelClass);
+        assert_eq!(diagnostic.snippet, "class SaleOrder(CustomBase):");
+        assert_eq!(diagnostic.location.to_string(), format!("{FILE}:1"));
+    }
+
+    #[test]
+    fn invalid_python_is_one_syntax_error_and_no_models() {
+        let file = parse(&[
+            "class A(models.Model):",
+            "    _name = ",
+            "class B(models.Model): pass",
+        ]);
+        assert!(file.models.is_empty());
+        assert_eq!(file.diagnostics.len(), 1);
+        assert_eq!(file.diagnostics[0].kind, DiagnosticKind::SyntaxError);
+        assert_eq!(
+            file.diagnostics[0].location.to_string(),
+            format!("{FILE}:2")
+        );
+        assert_eq!(file.diagnostics[0].snippet, "    _name = ");
+    }
+}

@@ -5,7 +5,7 @@
 
 use crate::symbol::Location;
 
-/// What kind of construct could not be read
+/// What kind of construct could not be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DiagnosticKind {
     /// The file is not valid Python.
@@ -16,6 +16,9 @@ pub enum DiagnosticKind {
     UnrecognizedInherit,
     /// `_inherits` is set to something other than a dict of strings.
     UnrecognizedInherits,
+    /// A class sets `_name`, `_inherit` or `_inherits`, but none of its bases
+    /// is an Odoo model class Pontix recognises.
+    UnrecognizedModelClass,
     /// A class attribute looks like a field but is not written `fields.X(...)`.
     UnrecognizedField,
 }

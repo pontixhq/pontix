@@ -34,3 +34,9 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+# ruff_unicode_names2 (pulled in by ruff_python_parser) embeds Unicode data
+# under Unicode-DFS-2016. Allowed for this crate only, not workspace-wide.
+[[licenses.exceptions]]
+crate = "ruff_unicode_names2"
+allow = ["Unicode-DFS-2016"]

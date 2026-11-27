@@ -13,6 +13,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-
-[dev-dependencies]
-pontix-core = { path = "../pontix-core" }
+pontix-core = { path = "../pontix-core"}
+ruff_python_ast = "0.0.23"
+ruff_python_parser = "0.0.23"
+ruff_source_file = "0.0.23"
+ruff_text_size = "0.0.23"
