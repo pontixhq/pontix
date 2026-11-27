@@ -10,6 +10,7 @@
 //! [`MAX_FILE_SIZE`] are not read.
 #![forbid(unsafe_code)]
 
+mod bases;
 mod effective;
 mod files;
 mod install;

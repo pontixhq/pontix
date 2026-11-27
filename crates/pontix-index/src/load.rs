@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use pontix_core::{Diagnostic, DiagnosticKind, ModelDef, ModuleName};
-use pontix_parsers::{Import, parse_python};
+use pontix_parsers::{Candidate, Import, parse_python};
 
 use crate::files::Root;
 
@@ -12,8 +12,35 @@ use crate::files::Root;
 #[derive(Debug, Default)]
 pub(crate) struct Loaded {
     pub(crate) files: Vec<PathBuf>,
-    pub(crate) models: Vec<ModelDef>,
+    /// Model classes and candidates, in the order Python defines them.
+    pub(crate) classes: Vec<Class>,
+    /// What the base resolution needs from each file, in `files` order.
+    pub(crate) sources: Vec<PythonSource>,
     pub(crate) diagnostics: Vec<Diagnostic>,
+}
+
+/// A class found in a module: a model, or a candidate whose bases are
+/// resolved once every module is read.
+#[derive(Debug)]
+pub(crate) enum Class {
+    Model(ModelDef),
+    Candidate {
+        candidate: Candidate,
+        /// Index of its file in [`Loaded::sources`].
+        source: usize,
+    },
+}
+
+/// A loaded Python file as the rest of the Python world sees it.
+#[derive(Debug)]
+pub(crate) struct PythonSource {
+    /// Its dotted module name, such as `odoo.addons.base.models.res_users`.
+    pub(crate) dotted: String,
+    /// Whether it is a package's `__init__.py`.
+    pub(crate) is_package: bool,
+    pub(crate) imports: Vec<Import>,
+    /// Class names of the models it defines itself.
+    pub(crate) models: Vec<String>,
 }
 
 /// Loads every Python file of the module that Python would run when Odoo
@@ -37,6 +64,15 @@ enum Target {
     Package(PathBuf),
     /// A `.py` file; names imported from it are its attributes.
     Module,
+}
+
+impl Class {
+    fn line(&self) -> std::num::NonZeroU32 {
+        match self {
+            Self::Model(model) => model.location.line,
+            Self::Candidate { candidate, .. } => candidate.model.location.line,
+        }
+    }
 }
 
 struct Loader<'a> {
@@ -70,16 +106,55 @@ impl Loader<'_> {
         self.out.files.push(path.to_path_buf());
         self.out.diagnostics.extend(parsed.diagnostics);
 
-        let mut models = parsed.models.into_iter().peekable();
+        let index = self.out.sources.len();
+        self.out.sources.push(PythonSource {
+            dotted: self.dotted(path),
+            is_package: path.file_name().is_some_and(|name| name == "__init__.py"),
+            imports: parsed.imports.clone(),
+            models: parsed.models.iter().map(|m| m.class_name.clone()).collect(),
+        });
+
+        let mut classes: Vec<Class> = parsed
+            .models
+            .into_iter()
+            .map(Class::Model)
+            .chain(
+                parsed
+                    .candidates
+                    .into_iter()
+                    .map(|candidate| Class::Candidate {
+                        candidate,
+                        source: index,
+                    }),
+            )
+            .collect();
+        classes.sort_by_key(Class::line);
+        let mut classes = classes.into_iter().peekable();
         for import in &parsed.imports {
-            while let Some(model) =
-                models.next_if(|model| model.location.line < import.location.line)
-            {
-                self.out.models.push(model);
+            while let Some(class) = classes.next_if(|class| class.line() < import.location.line) {
+                self.out.classes.push(class);
             }
             self.import(path, import);
         }
-        self.out.models.extend(models);
+        self.out.classes.extend(classes);
+    }
+
+    /// `odoo.addons.<module>` followed by the file's path inside the module:
+    /// `models/sale.py` is `odoo.addons.<module>.models.sale` and
+    /// `models/__init__.py` is `odoo.addons.<module>.models`.
+    fn dotted(&self, path: &Path) -> String {
+        let mut dotted = format!("odoo.addons.{}", self.module);
+        let Ok(relative) = path.strip_prefix(self.module_dir) else {
+            return dotted;
+        };
+        for component in relative.with_extension("").components() {
+            let part = component.as_os_str().to_string_lossy();
+            if part != "__init__" {
+                dotted.push('.');
+                dotted.push_str(&part);
+            }
+        }
+        dotted
     }
 
     fn import(&mut self, current: &Path, import: &Import) {

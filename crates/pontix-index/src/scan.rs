@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use pontix_core::{Diagnostic, DiagnosticKind, Manifest, ModelDef, ModuleName, OdooVersion};
 use pontix_parsers::parse_manifest;
 
+use crate::bases;
 use crate::files::{Root, whole_file};
-use crate::load::load;
+use crate::load::{Class, PythonSource, load};
 
 /// One Odoo module and what Odoo would load from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,7 @@ pub fn scan(addons_paths: &[PathBuf], version: OdooVersion) -> Addons {
         diagnostics: Vec::new(),
     };
     let mut seen = HashSet::new();
+    let mut pending = Pending::default();
     for addons_path in addons_paths {
         let root = match Root::new(addons_path) {
             Ok(root) => root,
@@ -67,10 +69,23 @@ pub fn scan(addons_paths: &[PathBuf], version: OdooVersion) -> Addons {
             .collect();
         dirs.sort();
         for dir in dirs {
-            scan_module(&root, &dir, version, &mut seen, &mut addons);
+            scan_module(&root, &dir, version, &mut seen, &mut addons, &mut pending);
         }
     }
+    // Bases may live in any module, so candidates are decided last.
+    let models = bases::resolve(pending.classes, &pending.sources, &mut addons.diagnostics);
+    for (module, models) in addons.modules.iter_mut().zip(models) {
+        module.models = models;
+    }
     addons
+}
+
+/// Classes and files of every module, kept until all modules are read.
+#[derive(Default)]
+struct Pending {
+    /// Per module, in `Addons::modules` order.
+    classes: Vec<Vec<Class>>,
+    sources: Vec<PythonSource>,
 }
 
 fn scan_module(
@@ -79,6 +94,7 @@ fn scan_module(
     version: OdooVersion,
     seen: &mut HashSet<ModuleName>,
     addons: &mut Addons,
+    pending: &mut Pending,
 ) {
     match root.resolve(dir) {
         Ok(Some(canonical)) if canonical.is_dir() => {}
@@ -115,13 +131,29 @@ fn scan_module(
     };
     let loaded = load(root, dir, &name);
     addons.diagnostics.extend(loaded.diagnostics);
+    let offset = pending.sources.len();
+    pending.sources.extend(loaded.sources);
+    pending.classes.push(
+        loaded
+            .classes
+            .into_iter()
+            .map(|class| match class {
+                Class::Candidate { candidate, source } => Class::Candidate {
+                    candidate,
+                    source: source + offset,
+                },
+                model => model,
+            })
+            .collect(),
+    );
     addons.modules.push(Module {
         name,
         path: dir.to_path_buf(),
         manifest_path,
         manifest,
         python_files: loaded.files,
-        models: loaded.models,
+        // Filled in once candidates are resolved.
+        models: Vec::new(),
     });
 }
 
@@ -317,6 +349,85 @@ mod tests {
         );
         let addons = tree.scan(OdooVersion::V19);
         assert!(addons.diagnostics.is_empty(), "{:?}", addons.diagnostics);
+    }
+
+    /// `z_base` defines a model class that modules sorted before it import.
+    fn with_identity_check(tree: &Tree) -> &Tree {
+        tree.module("z_base", "from . import models\n")
+            .write(
+                "z_base/models/__init__.py",
+                "from . import res_users\nfrom .res_users import CheckIdentity\n",
+            )
+            .write(
+                "z_base/models/res_users.py",
+                "class CheckIdentity(models.TransientModel):\n    _name = 'res.users.identitycheck'\n",
+            )
+    }
+
+    #[test]
+    fn a_model_base_imported_from_another_module_makes_a_model() {
+        let tree = Tree::new();
+        with_identity_check(&tree)
+            .module(
+                "a_passkey",
+                "from odoo.addons.z_base.models.res_users import CheckIdentity\n\nclass CheckIdentityPasskeys(CheckIdentity):\n    _inherit = 'res.users.identitycheck'\n",
+            );
+        let addons = tree.scan(OdooVersion::V18);
+        assert!(addons.diagnostics.is_empty(), "{:?}", addons.diagnostics);
+        assert_eq!(addons.modules[0].name.as_str(), "a_passkey");
+        assert_eq!(class_names(&addons.modules[0]), ["CheckIdentityPasskeys"]);
+    }
+
+    #[test]
+    fn module_attributes_reexports_and_chains_are_followed() {
+        let tree = Tree::new();
+        with_identity_check(&tree).module(
+            "a_custom",
+            concat!(
+                "from odoo.addons.z_base.models import res_users\n",
+                "from odoo.addons.z_base.models import CheckIdentity as Check\n",
+                "import odoo.addons.z_base.models.res_users as users\n",
+                "class ByAttribute(res_users.CheckIdentity): pass\n",
+                "class ByReexport(Check): pass\n",
+                "class ByAlias(users.CheckIdentity): pass\n",
+                "class ByChain(ByReexport): pass\n",
+            ),
+        );
+        let addons = tree.scan(OdooVersion::V19);
+        assert!(addons.diagnostics.is_empty(), "{:?}", addons.diagnostics);
+        assert_eq!(
+            class_names(&addons.modules[0]),
+            ["ByAttribute", "ByReexport", "ByAlias", "ByChain"]
+        );
+    }
+
+    #[test]
+    fn unresolved_candidates_are_reported_only_when_they_look_like_models() {
+        let tree = Tree::new();
+        tree.module(
+            "m",
+            concat!(
+                "from odoo.addons.elsewhere import Mystery\n",
+                "class Error(Exception): pass\n",
+                "class Controller(http.Controller): pass\n",
+                "class SaleOrder(Mystery):\n",
+                "    _inherit = 'sale.order'\n",
+            ),
+        );
+        let addons = tree.scan(OdooVersion::V19);
+        assert!(addons.modules[0].models.is_empty());
+        let seen: Vec<(DiagnosticKind, &str)> = addons
+            .diagnostics
+            .iter()
+            .map(|d| (d.kind, d.snippet.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [(
+                DiagnosticKind::UnrecognizedModelClass,
+                "class SaleOrder(Mystery):"
+            )]
+        );
     }
 
     #[test]

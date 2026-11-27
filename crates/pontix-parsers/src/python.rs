@@ -41,11 +41,34 @@ const MODEL_ATTRIBUTES: [(&str, Attribute); 3] = [
     ("_inherits", Attribute::Inherits),
 ];
 
+/// A module-level class whose bases are not model classes this file can see,
+/// for example `class CheckIdentityPasskeys(CheckIdentity)` with
+/// `CheckIdentity` imported from `base` (`auth_passkey`, Odoo 18). Python
+/// makes it a model when one of its bases is a model class; the indexer
+/// decides once every file is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// The class, read as if it were a model.
+    pub model: ModelDef,
+    /// Its bases written as names or dotted names, such as `CheckIdentity`
+    /// or `res_users.CheckIdentity`.
+    pub bases: Vec<String>,
+    /// Whether the body sets `_name`, `_inherit` or `_inherits`.
+    pub sets_model_attributes: bool,
+    /// What could not be read in the body; it counts only for a model.
+    pub diagnostics: Vec<Diagnostic>,
+    /// The report for a class that sets model attributes but turns out to
+    /// have no model base.
+    pub unrecognized: Diagnostic,
+}
+
 /// What one Python file declares.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PythonFile {
     /// Model classes, in source order.
     pub models: Vec<ModelDef>,
+    /// Classes that may be models through a base defined in another file.
+    pub candidates: Vec<Candidate>,
     /// Imports that run when the file is imported, in source order.
     pub imports: Vec<Import>,
     /// Names bound at module level when the file is imported: assignments,
@@ -93,21 +116,29 @@ struct Reader<'a> {
 
 impl Reader<'_> {
     fn class(&mut self, class: &StmtClassDef) {
-        let is_model = class.arguments.as_deref().is_some_and(|arguments| {
-            arguments
-                .args
-                .iter()
-                .any(|base| is_model_base(base) || self.is_model_class_in_this_file(base))
-        });
+        let bases: Vec<&Expr> = class
+            .arguments
+            .as_deref()
+            .map(|arguments| arguments.args.iter().collect())
+            .unwrap_or_default();
+        if bases
+            .iter()
+            .any(|base| is_model_base(base) || self.is_model_class_in_this_file(base))
+        {
+            let model = self.read_model(class);
+            self.out.models.push(model);
+            return;
+        }
 
-        if !is_model {
+        let sets_model_attributes = class
+            .body
+            .iter()
+            .any(|stmt| model_attribute(stmt).is_some());
+        let written: Vec<String> = bases.iter().filter_map(|base| dotted_name(base)).collect();
+        if written.is_empty() {
             // A plain Python class is none of our business, unless it sets the
             // attributes only a model uses: then its base is one we cannot see.
-            if class
-                .body
-                .iter()
-                .any(|stmt| model_attribute(stmt).is_some())
-            {
+            if sets_model_attributes {
                 self.report_line(
                     DiagnosticKind::UnrecognizedModelClass,
                     class.name.range.start(),
@@ -116,6 +147,25 @@ impl Reader<'_> {
             return;
         }
 
+        // Read it as a model, keeping its diagnostics apart: they only count
+        // if the indexer finds that a base is a model class.
+        let before = self.out.diagnostics.len();
+        let model = self.read_model(class);
+        let diagnostics = self.out.diagnostics.split_off(before);
+        self.out.candidates.push(Candidate {
+            model,
+            bases: written,
+            sets_model_attributes,
+            diagnostics,
+            unrecognized: self.source.line_diagnostic(
+                DiagnosticKind::UnrecognizedModelClass,
+                class.name.range.start(),
+            ),
+        });
+    }
+
+    /// Reads a class body as a model: identity, inheritance, fields, methods.
+    fn read_model(&mut self, class: &StmtClassDef) -> ModelDef {
         let mut model = ModelDef {
             class_name: class.name.as_str().to_string(),
             name: None,
@@ -172,7 +222,7 @@ impl Reader<'_> {
             }
         }
 
-        self.out.models.push(model);
+        model
     }
 
     /// Reports model classes defined inside a module-level compound
@@ -327,6 +377,20 @@ fn attribute_name(target: &Expr) -> Option<Attribute> {
     MODEL_ATTRIBUTES
         .into_iter()
         .find_map(|(written, attribute)| (name.id.as_str() == written).then_some(attribute))
+}
+
+/// `Name` or `a.b.Name`, as written; `None` for anything else, such as a
+/// call or a subscript.
+fn dotted_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(name) => Some(name.id.as_str().to_string()),
+        Expr::Attribute(attribute) => Some(format!(
+            "{}.{}",
+            dotted_name(&attribute.value)?,
+            attribute.attr.as_str()
+        )),
+        _ => None,
+    }
 }
 
 /// `models.Model`, `odoo.models.Model` or a bare `Model`, and the same for
@@ -503,10 +567,7 @@ mod tests {
             "    _name = 'late'",
         ]);
         assert_eq!(only_model(&file).class_name, "Late");
-        assert_eq!(
-            file.diagnostics[0].kind,
-            DiagnosticKind::UnrecognizedModelClass
-        );
+        assert_eq!(file.candidates[0].bases, ["Late"]);
     }
 
     #[test]
@@ -638,17 +699,57 @@ mod tests {
     }
 
     #[test]
-    fn model_attributes_on_an_unknown_base_are_reported() {
+    fn classes_on_unknown_bases_become_candidates() {
         let file = parse(&[
             "class SaleOrder(CustomBase):",
             "    _inherit = 'sale.order'",
+            "    note = Char()",
+            "class Passkeys(res_users.CheckIdentity):",
+            "    pass",
+            "class Built(make_base()):",
+            "    _inherit = 'res.partner'",
         ]);
         assert!(file.models.is_empty());
-        assert_eq!(file.diagnostics.len(), 1);
-        let diagnostic = &file.diagnostics[0];
-        assert_eq!(diagnostic.kind, DiagnosticKind::UnrecognizedModelClass);
-        assert_eq!(diagnostic.snippet, "class SaleOrder(CustomBase):");
-        assert_eq!(diagnostic.location.to_string(), format!("{FILE}:1"));
+        let candidates: Vec<(&str, Vec<&str>, bool, usize)> = file
+            .candidates
+            .iter()
+            .map(|c| {
+                (
+                    c.model.class_name.as_str(),
+                    c.bases.iter().map(String::as_str).collect(),
+                    c.sets_model_attributes,
+                    c.diagnostics.len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            candidates,
+            [
+                ("SaleOrder", vec!["CustomBase"], true, 1),
+                ("Passkeys", vec!["res_users.CheckIdentity"], false, 0),
+            ]
+        );
+        assert_eq!(
+            file.candidates[0].model.inherit,
+            Inherit::Single(name("sale.order"))
+        );
+        assert_eq!(
+            file.candidates[0].unrecognized.snippet,
+            "class SaleOrder(CustomBase):"
+        );
+        // A base that is not a name cannot be resolved later either.
+        let seen: Vec<(DiagnosticKind, &str)> = file
+            .diagnostics
+            .iter()
+            .map(|d| (d.kind, d.snippet.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [(
+                DiagnosticKind::UnrecognizedModelClass,
+                "class Built(make_base()):"
+            )]
+        );
     }
 
     #[test]
@@ -804,6 +905,8 @@ mod tests {
                 "models", "wizard", "so", "tools", "odoo", "logging", "optional", "helper", "Thing"
             ]
         );
+        assert_eq!(file.imports[1].bindings, ["so"]);
+        assert_eq!(file.imports[3].bindings, ["odoo"]);
     }
 
     #[test]

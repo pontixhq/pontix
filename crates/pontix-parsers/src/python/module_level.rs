@@ -19,6 +19,10 @@ pub struct Import {
     /// The names after `import` in a `from` import, `*` included; empty for
     /// a plain `import a.b`.
     pub names: Vec<String>,
+    /// The name each import binds in the importing file: for a `from`
+    /// import, one per entry of `names` (its `as` alias or the name itself,
+    /// empty for `*`); for `import a.b`, `a`, or the `as` alias.
+    pub bindings: Vec<String>,
     /// Where the statement is.
     pub location: Location,
     /// The whole statement, exactly as written.
@@ -64,6 +68,7 @@ impl Collector<'_, '_> {
                 level: 0,
                 module: Some(module.to_string()),
                 names: Vec::new(),
+                bindings: vec![bound.to_string()],
                 location: self.source.location(stmt.start()),
                 statement: self.source.text(stmt.range()).to_string(),
             });
@@ -71,10 +76,14 @@ impl Collector<'_, '_> {
     }
 
     fn import_from(&mut self, stmt: &StmtImportFrom) {
+        let mut bindings = Vec::with_capacity(stmt.names.len());
         for alias in &stmt.names {
-            let bound = alias.asname.as_ref().unwrap_or(&alias.name);
-            if bound.as_str() != "*" {
-                self.out.bound_names.push(bound.as_str().to_string());
+            let bound = alias.asname.as_ref().unwrap_or(&alias.name).as_str();
+            if bound == "*" {
+                bindings.push(String::new());
+            } else {
+                self.out.bound_names.push(bound.to_string());
+                bindings.push(bound.to_string());
             }
         }
         self.out.imports.push(Import {
@@ -88,6 +97,7 @@ impl Collector<'_, '_> {
                 .iter()
                 .map(|alias| alias.name.as_str().to_string())
                 .collect(),
+            bindings,
             location: self.source.location(stmt.start()),
             statement: self.source.text(stmt.range()).to_string(),
         });
