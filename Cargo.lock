@@ -359,6 +359,14 @@ name = "pontix-core"
 version = "0.0.0"
 
 [[package]]
+name = "pontix-diff"
+version = "0.0.0"
+dependencies = [
+ "pontix-core",
+ "pontix-index",
+]
+
+[[package]]
 name = "pontix-index"
 version = "0.0.0"
 dependencies = [

@@ -5,6 +5,7 @@
 //! two Odoo versions, and the findings reported to users (PTX codes).
 #![forbid(unsafe_code)]
 
+pub mod change;
 pub mod diagnostic;
 pub mod field_type;
 pub mod manifest;
@@ -12,6 +13,7 @@ pub mod resolve;
 pub mod symbol;
 pub mod version;
 
+pub use change::{Change, ChangeSet};
 pub use diagnostic::{Diagnostic, DiagnosticKind};
 pub use field_type::FieldType;
 pub use manifest::{AutoInstall, Manifest, ModuleName};
