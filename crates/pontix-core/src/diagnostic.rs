@@ -21,6 +21,9 @@ pub enum DiagnosticKind {
     UnrecognizedModelClass,
     /// A class attribute looks like a field but is not written `fields.X(...)`.
     UnrecognizedField,
+    /// A relational field names its comodel with something other than a
+    /// string literal. The field itself is still read.
+    UnrecognizedComodel,
 }
 
 /// Something a parser could not read, with the source text exactly as written.

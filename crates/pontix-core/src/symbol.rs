@@ -83,6 +83,9 @@ pub struct FieldDef {
     /// Field type as written after `fields.`, for example `Many2one`.
     pub field_type: FieldType,
     /// Target model of a relational field (`Many2one`, `One2many`, `Many2many`).
+    /// `None` when the declaration does not name one, for example a
+    /// redefinition `fields.Many2one(ondelete="cascade")` that keeps the
+    /// comodel of the field it overrides.
     pub comodel: Option<ModelName>,
     /// Where the field is declared.
     pub location: Location,
@@ -93,7 +96,8 @@ pub struct FieldDef {
 pub struct MethodDef {
     /// Method name.
     pub name: String,
-    /// Parameter names, without `self`.
+    /// Parameter names in declaration order, without the receiver (`self` or
+    /// `cls`); `*args` and `**kwargs` keep their stars.
     pub params: Vec<String>,
     /// True when the method body calls `super()`.
     pub calls_super: bool,

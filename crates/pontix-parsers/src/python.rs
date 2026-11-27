@@ -4,16 +4,22 @@
 //! models. Whatever cannot be read with certainty becomes a [`Diagnostic`]
 //! carrying the source text exactly as written.
 
+mod field;
+mod method;
+
 use std::num::NonZeroU32;
 use std::path::Path;
 
 use pontix_core::{
-    Delegation, Diagnostic, DiagnosticKind, FieldName, Inherit, Location, ModelDef, ModelName,
+    Delegation, Diagnostic, DiagnosticKind, FieldDef, FieldName, Inherit, Location, MethodDef,
+    ModelDef, ModelName,
 };
-use ruff_python_ast::{Expr, ExprList, ExprTuple, Stmt, StmtClassDef};
+use ruff_python_ast::{Expr, ExprList, ExprName, ExprTuple, Stmt, StmtClassDef};
 use ruff_python_parser::parse_module;
 use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextRange, TextSize};
+
+use self::field::{Comodel, Field};
 
 /// Classes from `odoo.models` that make a subclass an Odoo model. Core uses
 /// `BaseModel` directly too, for example in `hr_skills` reports (Odoo 19).
@@ -113,6 +119,19 @@ impl Reader<'_> {
         // Statements run top to bottom, so a later assignment replaces an
         // earlier one, and one we cannot read leaves the value unknown.
         for stmt in &class.body {
+            if let Stmt::FunctionDef(def) = stmt {
+                model.methods.push(MethodDef {
+                    name: def.name.as_str().to_string(),
+                    params: method::params(def),
+                    calls_super: method::calls_super(def),
+                    location: self.location(def.name.range.start()),
+                });
+                continue;
+            }
+            if let Some((target, value)) = field_assignment(stmt) {
+                self.field(&mut model, stmt, target, value);
+                continue;
+            }
             let Some(assignment) = model_attribute(stmt) else {
                 continue;
             };
@@ -146,6 +165,35 @@ impl Reader<'_> {
         self.out.models.push(model);
     }
 
+    /// Adds `target = value` to the model when the value is a field.
+    fn field(&mut self, model: &mut ModelDef, stmt: &Stmt, target: &ExprName, value: &Expr) {
+        let Some(declaration) = field::field(value, model.name.as_ref()) else {
+            return;
+        };
+        let Field::Declared {
+            field_type,
+            comodel,
+        } = declaration
+        else {
+            self.report(DiagnosticKind::UnrecognizedField, stmt.range());
+            return;
+        };
+        let comodel = match comodel {
+            Comodel::Absent => None,
+            Comodel::Named(name) => Some(name),
+            Comodel::Unreadable => {
+                // The field exists either way; only its comodel is unknown.
+                self.report(DiagnosticKind::UnrecognizedComodel, stmt.range());
+                None
+            }
+        };
+        model.fields.push(FieldDef {
+            name: FieldName::new(target.id.as_str()),
+            field_type,
+            comodel,
+            location: self.location(target.range.start()),
+        });
+    }
     /// A base written as the name of a model class defined earlier in this
     /// file, for example `class WebsitePublishedMultiMixin(WebsitePublishedMixin)`
     /// in `website/models/mixins.py`. Python only sees classes defined above,
@@ -193,6 +241,24 @@ impl Reader<'_> {
             .and_then(NonZeroU32::new)
             .unwrap_or(NonZeroU32::MAX);
         Location::new(self.file, line)
+    }
+}
+
+/// `name = value` or `name: T = value` with a single, non-underscore name,
+/// the only shapes a field declaration takes. Names starting with `_` are
+/// model attributes (`_name`, `_order`, ...), never fields.
+fn field_assignment(stmt: &Stmt) -> Option<(&ExprName, &Expr)> {
+    let (target, value) = match stmt {
+        Stmt::Assign(assign) => match assign.targets.as_slice() {
+            [target] => (target, &*assign.value),
+            _ => return None,
+        },
+        Stmt::AnnAssign(assign) => (&*assign.target, assign.value.as_deref()?),
+        _ => return None,
+    };
+    match target {
+        Expr::Name(name) if !name.id.as_str().starts_with('_') => Some((name, value)),
+        _ => None,
     }
 }
 
@@ -569,5 +635,87 @@ mod tests {
             format!("{FILE}:2")
         );
         assert_eq!(file.diagnostics[0].snippet, "    _name = ");
+    }
+
+    #[test]
+    fn reads_fields_and_methods_in_source_order() {
+        let file = parse(&[
+            "class SaleOrder(models.Model):",
+            "    _inherit = 'sale.order'",
+            "",
+            "    partner_id = fields.Many2one(ondelete='restrict')",
+            "    carrier_id: fields.Many2one = fields.Many2one('delivery.carrier')",
+            "    _sql_constraints = [('name_uniq', 'unique(name)', 'Must be unique')]",
+            "    _name_uniq = models.Constraint('UNIQUE(name)', 'Must be unique')",
+            "",
+            "    def action_confirm(self):",
+            "        return super().action_confirm()",
+        ]);
+        let model = only_model(&file);
+        let fields: Vec<(&str, &str, Option<&str>, String)> = model
+            .fields
+            .iter()
+            .map(|f| {
+                (
+                    f.name.as_str(),
+                    f.field_type.as_str(),
+                    f.comodel.as_ref().map(ModelName::as_str),
+                    f.location.to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                ("partner_id", "Many2one", None, format!("{FILE}:4")),
+                (
+                    "carrier_id",
+                    "Many2one",
+                    Some("delivery.carrier"),
+                    format!("{FILE}:5")
+                ),
+            ]
+        );
+        assert_eq!(
+            model.methods,
+            [MethodDef {
+                name: "action_confirm".to_string(),
+                params: vec![],
+                calls_super: true,
+                location: Location::new(FILE, NonZeroU32::new(9).expect("nine is not zero")),
+            }]
+        );
+        assert!(file.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unreadable_fields_are_reported_and_unreadable_comodels_keep_the_field() {
+        let file = parse(&[
+            "class A(models.Model):",
+            "    name = Char(string='Name')",
+            "    partner_id = fields.Many2one(PARTNER)",
+        ]);
+        let model = only_model(&file);
+        assert_eq!(model.fields.len(), 1);
+        assert_eq!(model.fields[0].name.as_str(), "partner_id");
+        assert_eq!(model.fields[0].comodel, None);
+        let kinds: Vec<(DiagnosticKind, &str)> = file
+            .diagnostics
+            .iter()
+            .map(|d| (d.kind, d.snippet.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (
+                    DiagnosticKind::UnrecognizedField,
+                    "name = Char(string='Name')"
+                ),
+                (
+                    DiagnosticKind::UnrecognizedComodel,
+                    "partner_id = fields.Many2one(PARTNER)"
+                ),
+            ]
+        );
     }
 }
