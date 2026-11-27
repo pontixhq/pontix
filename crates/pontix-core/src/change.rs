@@ -18,6 +18,100 @@ pub struct ChangeSet {
     pub target: OdooVersion,
     /// The changes, ordered by model, then by what they are about.
     pub changes: Vec<Change>,
+    /// Removals and additions that look like one thing renamed. Never
+    /// certain: each comes with how confident Pontix is and why.
+    pub renames: Vec<Rename>,
+}
+
+/// How strongly the evidence points to a rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Confidence {
+    /// Plausible, but the evidence is thin: check before relying on it.
+    Low,
+    /// Likely.
+    Medium,
+    /// The evidence agrees from several sides.
+    High,
+}
+
+/// One reason to believe a rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Evidence {
+    /// The names are the same once `_id`, `_ids` and plural endings are
+    /// dropped, as in `tax_id` and `tax_ids`.
+    SameStem,
+    /// The names are this similar, from 0 to 100.
+    SimilarName(u8),
+    /// One name, without `_id`/`_ids`, ends or starts with the other, as
+    /// `stock_move_ids` and `move_ids`, or `date_start` and
+    /// `contract_date_start`.
+    NameContained,
+    /// The two fields have the same type, and the same comodel when they
+    /// are relational.
+    SameShape,
+    /// They are the only removed and the only added field of that shape on
+    /// the model.
+    OnlyCandidate,
+    /// This many fields elsewhere now point to the new model instead of the
+    /// old one: same field, new comodel.
+    FieldsRepointed(u32),
+    /// On this many models, a field pointing to the old model was removed
+    /// while a field pointing to the new one was added.
+    ReferencesSwapped(u32),
+    /// The old and new model share this share of their field names, from 0
+    /// to 100, counting only fields besides the ones every model has.
+    SharedFields(u8),
+    /// This many fields moved from the old module to the new one.
+    FieldsMoved(u32),
+}
+
+/// Something that looks renamed between the two versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rename {
+    /// A removed module whose fields moved to another module.
+    Module {
+        /// The removed module.
+        from: ModuleName,
+        /// The module that took its fields over.
+        to: ModuleName,
+        /// Whether `to` already existed in the source version, so the old
+        /// module was merged into it rather than renamed.
+        merged: bool,
+        /// How likely.
+        confidence: Confidence,
+        /// Why.
+        evidence: Vec<Evidence>,
+    },
+    /// A removed model that looks continued by another one.
+    Model {
+        /// The removed model.
+        from: ModelName,
+        /// The model that continues it.
+        to: ModelName,
+        /// Whether `to` already existed in the source version, so the old
+        /// model was merged into it rather than renamed.
+        merged: bool,
+        /// How likely.
+        confidence: Confidence,
+        /// Why.
+        evidence: Vec<Evidence>,
+    },
+    /// A removed field that looks continued by an added one, on the same
+    /// model or on the model it was renamed to.
+    Field {
+        /// The model in the source version.
+        model: ModelName,
+        /// The removed field.
+        from: FieldName,
+        /// The model in the target version, when it was renamed too.
+        to_model: ModelName,
+        /// The added field.
+        to: FieldName,
+        /// How likely.
+        confidence: Confidence,
+        /// Why.
+        evidence: Vec<Evidence>,
+    },
 }
 
 /// One difference between the source and the target version.

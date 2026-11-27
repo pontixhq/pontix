@@ -7,6 +7,7 @@
 //! custom code that does not depend on that module.
 #![forbid(unsafe_code)]
 
+mod rename;
 mod view;
 
 use std::collections::BTreeSet;
@@ -51,10 +52,15 @@ pub fn diff(source: &Installation<'_>, target: &Installation<'_>) -> ChangeSet {
         }
     }
 
+    let source_modules: BTreeSet<_> = source.modules.iter().map(|m| &m.name).collect();
+    let renames = rename::renames(&changes, &before, &after, |module| {
+        source_modules.contains(module)
+    });
     ChangeSet {
         source: source.version,
         target: target.version,
         changes,
+        renames,
     }
 }
 
@@ -179,8 +185,8 @@ mod tests {
     use std::path::PathBuf;
 
     use pontix_core::{
-        AutoInstall, FieldDef, FieldName, FieldType, Inherit, Manifest, MethodDef, ModelDef,
-        ModuleName, OdooVersion,
+        AutoInstall, Confidence, FieldDef, FieldName, FieldType, Inherit, Manifest, MethodDef,
+        ModelDef, ModuleName, OdooVersion, Rename,
     };
     use pontix_index::{Addons, Module, install};
 
@@ -543,6 +549,133 @@ mod tests {
                     after: at("models.py", 40),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_renamed_model_carries_its_fields_and_comodels_along() {
+        let packaging = |model_name: &str, fields: Vec<FieldDef>| {
+            model(model_name, Inherit::Absent, fields, vec![])
+        };
+        let source = vec![module(
+            "base",
+            &[],
+            vec![
+                packaging(
+                    "product.packaging",
+                    vec![
+                        field("name", FieldType::Char, None, 1),
+                        field("qty", FieldType::Float, None, 2),
+                        field("barcode", FieldType::Char, None, 3),
+                        field(
+                            "product_id",
+                            FieldType::Many2one,
+                            Some("product.product"),
+                            4,
+                        ),
+                    ],
+                ),
+                packaging(
+                    "product.product",
+                    vec![field(
+                        "packaging_ids",
+                        FieldType::One2many,
+                        Some("product.packaging"),
+                        10,
+                    )],
+                ),
+                packaging(
+                    "sale.order.line",
+                    vec![field(
+                        "product_packaging_id",
+                        FieldType::Many2one,
+                        Some("product.packaging"),
+                        20,
+                    )],
+                ),
+            ],
+        )];
+        let target = vec![module(
+            "base",
+            &[],
+            vec![
+                packaging(
+                    "product.uom",
+                    vec![
+                        field("name", FieldType::Char, None, 1),
+                        field("qty", FieldType::Float, None, 2),
+                        field("barcode", FieldType::Char, None, 3),
+                        field("uom_id", FieldType::Many2one, Some("uom.uom"), 4),
+                    ],
+                ),
+                packaging(
+                    "product.product",
+                    vec![field(
+                        "product_uom_ids",
+                        FieldType::One2many,
+                        Some("product.uom"),
+                        10,
+                    )],
+                ),
+                packaging(
+                    "sale.order.line",
+                    vec![field(
+                        "product_uom_line_id",
+                        FieldType::Many2one,
+                        Some("product.uom"),
+                        20,
+                    )],
+                ),
+            ],
+        )];
+        let all = |modules: &[Module]| -> Vec<ModuleName> {
+            modules.iter().map(|m| m.name.clone()).collect()
+        };
+        let source = Addons {
+            version: OdooVersion::V18,
+            diagnostics: Vec::new(),
+            modules: source,
+        };
+        let target = Addons {
+            version: OdooVersion::V19,
+            diagnostics: Vec::new(),
+            modules: target,
+        };
+        let set = diff(
+            &install(&source, &all(&source.modules), &[]),
+            &install(&target, &all(&target.modules), &[]),
+        );
+        let model_renames: Vec<(&str, &str, Confidence, bool)> = set
+            .renames
+            .iter()
+            .filter_map(|r| match r {
+                Rename::Model {
+                    from,
+                    to,
+                    confidence,
+                    merged,
+                    ..
+                } => Some((from.as_str(), to.as_str(), *confidence, *merged)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            model_renames,
+            [("product.packaging", "product.uom", Confidence::High, false)]
+        );
+        let field_renames: Vec<(&str, &str, &str)> = set
+            .renames
+            .iter()
+            .filter_map(|r| match r {
+                Rename::Field {
+                    model, from, to, ..
+                } => Some((model.as_str(), from.as_str(), to.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            field_renames.contains(&("product.product", "packaging_ids", "product_uom_ids")),
+            "{field_renames:?}"
         );
     }
 }

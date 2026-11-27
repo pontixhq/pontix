@@ -13,7 +13,7 @@ pub mod resolve;
 pub mod symbol;
 pub mod version;
 
-pub use change::{Change, ChangeSet};
+pub use change::{Change, ChangeSet, Confidence, Evidence, Rename};
 pub use diagnostic::{Diagnostic, DiagnosticKind};
 pub use field_type::FieldType;
 pub use manifest::{AutoInstall, Manifest, ModuleName};
