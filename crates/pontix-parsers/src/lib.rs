@@ -6,6 +6,9 @@
 //! be replaced without touching callers.
 #![forbid(unsafe_code)]
 
+pub mod manifest;
 pub mod python;
+mod source;
 
+pub use manifest::{ManifestFile, parse_manifest};
 pub use python::{PythonFile, parse_python};

@@ -24,6 +24,13 @@ pub enum DiagnosticKind {
     /// A relational field names its comodel with something other than a
     /// string literal. The field itself is still read.
     UnrecognizedComodel,
+    /// `__manifest__.py` is not a single literal expression. Odoo reads it
+    /// with `ast.literal_eval` and silently ignores the whole module when
+    /// that fails.
+    UnrecognizedManifest,
+    /// A manifest key Pontix reads holds a value of the wrong shape, for
+    /// example `'depends': 'sale'` instead of a list.
+    UnrecognizedManifestValue,
 }
 
 /// Something a parser could not read, with the source text exactly as written.

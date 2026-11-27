@@ -7,19 +7,18 @@
 mod field;
 mod method;
 
-use std::num::NonZeroU32;
 use std::path::Path;
 
 use pontix_core::{
-    Delegation, Diagnostic, DiagnosticKind, FieldDef, FieldName, Inherit, Location, MethodDef,
-    ModelDef, ModelName,
+    Delegation, Diagnostic, DiagnosticKind, FieldDef, FieldName, Inherit, MethodDef, ModelDef,
+    ModelName,
 };
 use ruff_python_ast::{Expr, ExprList, ExprName, ExprTuple, Stmt, StmtClassDef};
 use ruff_python_parser::parse_module;
-use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use self::field::{Comodel, Field};
+use crate::source::SourceFile;
 
 /// Classes from `odoo.models` that make a subclass an Odoo model. Core uses
 /// `BaseModel` directly too, for example in `hr_skills` reports (Odoo 19).
@@ -55,9 +54,7 @@ pub struct PythonFile {
 /// [`DiagnosticKind::SyntaxError`] and no models, because Odoo cannot import it.
 pub fn parse_python(file: &Path, source: &str) -> PythonFile {
     let mut reader = Reader {
-        file,
-        source,
-        lines: LineIndex::from_source_text(source),
+        source: SourceFile::new(file, source),
         out: PythonFile::default(),
     };
     match parse_module(source) {
@@ -75,9 +72,7 @@ pub fn parse_python(file: &Path, source: &str) -> PythonFile {
 
 /// One file being read; collects models and diagnostics as it goes.
 struct Reader<'a> {
-    file: &'a Path,
-    source: &'a str,
-    lines: LineIndex,
+    source: SourceFile<'a>,
     out: PythonFile,
 }
 
@@ -113,7 +108,7 @@ impl Reader<'_> {
             inherits: Vec::new(),
             fields: Vec::new(),
             methods: Vec::new(),
-            location: self.location(class.name.range.start()),
+            location: self.source.location(class.name.range.start()),
         };
 
         // Statements run top to bottom, so a later assignment replaces an
@@ -124,7 +119,7 @@ impl Reader<'_> {
                     name: def.name.as_str().to_string(),
                     params: method::params(def),
                     calls_super: method::calls_super(def),
-                    location: self.location(def.name.range.start()),
+                    location: self.source.location(def.name.range.start()),
                 });
                 continue;
             }
@@ -191,9 +186,10 @@ impl Reader<'_> {
             name: FieldName::new(target.id.as_str()),
             field_type,
             comodel,
-            location: self.location(target.range.start()),
+            location: self.source.location(target.range.start()),
         });
     }
+
     /// A base written as the name of a model class defined earlier in this
     /// file, for example `class WebsitePublishedMultiMixin(WebsitePublishedMixin)`
     /// in `website/models/mixins.py`. Python only sees classes defined above,
@@ -209,38 +205,14 @@ impl Reader<'_> {
             .any(|model| model.class_name == name.id.as_str())
     }
 
-    /// Reports the source text of `range`, exactly as written.
     fn report(&mut self, kind: DiagnosticKind, range: TextRange) {
-        let snippet = self.source[range].to_string();
-        self.push(kind, range.start(), snippet);
+        let diagnostic = self.source.diagnostic(kind, range);
+        self.out.diagnostics.push(diagnostic);
     }
 
-    /// Reports the whole line containing `offset`, without its line ending.
     fn report_line(&mut self, kind: DiagnosticKind, offset: TextSize) {
-        let line = self
-            .lines
-            .line_range(self.lines.line_index(offset), self.source);
-        let snippet = self.source[line].trim_end_matches(['\r', '\n']).to_string();
-        self.push(kind, offset, snippet);
-    }
-
-    fn push(&mut self, kind: DiagnosticKind, offset: TextSize, snippet: String) {
-        let location = self.location(offset);
-        self.out.diagnostics.push(Diagnostic {
-            kind,
-            location,
-            snippet,
-        });
-    }
-
-    fn location(&self, offset: TextSize) -> Location {
-        // Saturates instead of failing: a source file cannot realistically
-        // have more than u32::MAX lines.
-        let line = u32::try_from(self.lines.line_index(offset).get())
-            .ok()
-            .and_then(NonZeroU32::new)
-            .unwrap_or(NonZeroU32::MAX);
-        Location::new(self.file, line)
+        let diagnostic = self.source.line_diagnostic(kind, offset);
+        self.out.diagnostics.push(diagnostic);
     }
 }
 
@@ -367,6 +339,10 @@ fn delegations(expr: &Expr) -> Option<Vec<Delegation>> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
+    use pontix_core::Location;
+
     use super::*;
 
     const FILE: &str = "models/sale_order.py";
