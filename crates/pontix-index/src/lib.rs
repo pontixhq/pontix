@@ -15,8 +15,9 @@ mod effective;
 mod files;
 mod install;
 mod load;
+pub mod registry;
 mod scan;
 
 pub use files::MAX_FILE_SIZE;
-pub use install::{Installation, ModelRef, install};
+pub use install::{InstallOptions, Installation, ModelRef, install, install_with};
 pub use scan::{Addons, Module, scan};

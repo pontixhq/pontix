@@ -12,7 +12,12 @@ source.
 | --- | --- | --- |
 | `pontix-core` | Shared data types: symbols, changes, findings (PTX codes) | Apache-2.0 |
 | `pontix-parsers` | Python and XML parsers for Odoo source | Apache-2.0 |
+| `pontix-index` | Finds modules, installs them as Odoo would, and indexes their models | Apache-2.0 |
+| `pontix-diff` | Compares two indexed Odoo versions: what changed, and likely renames | Apache-2.0 |
+| `pontix-scan` | Finds what custom modules rely on in core, and what an upgrade breaks | FSL-1.1-ALv2 |
 | `pontix-cli` | The `pontix` command line tool | FSL-1.1-ALv2 |
+
+Apache-2.0 crates never depend on FSL crates.
 
 ## Development
 

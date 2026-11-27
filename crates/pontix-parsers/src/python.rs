@@ -11,8 +11,8 @@ mod module_level;
 use std::path::Path;
 
 use pontix_core::{
-    Delegation, Diagnostic, DiagnosticKind, FieldDef, FieldName, Inherit, MethodDef, ModelBase,
-    ModelDef, ModelName, Written,
+    Delegation, Diagnostic, DiagnosticKind, FieldDef, FieldName, FieldPaths, Inherit, MethodDef,
+    ModelBase, ModelDef, ModelName, Written,
 };
 use ruff_python_ast::visitor::{Visitor, walk_stmt};
 use ruff_python_ast::{Expr, ExprList, ExprName, ExprTuple, Stmt, StmtClassDef};
@@ -193,6 +193,14 @@ impl Reader<'_> {
                     name: def.name.as_str().to_string(),
                     params: method::params(def),
                     calls_super: method::calls_super(def),
+                    field_paths: method::field_paths(def)
+                        .into_iter()
+                        .map(|(decorator, paths, at)| FieldPaths {
+                            decorator,
+                            paths,
+                            location: self.source.location(at),
+                        })
+                        .collect(),
                     fingerprint: method::fingerprint(def),
                     location: self.source.location(def.name.range.start()),
                 });

@@ -18,6 +18,16 @@ pub(crate) struct Effective {
 /// Applies the manifest rules of `version`, or explains why Odoo would not
 /// install the module at all.
 pub(crate) fn effective(module: &Module, version: OdooVersion) -> Result<Effective, Diagnostic> {
+    effective_for(module, version, false)
+}
+
+/// [`effective`], with `any_series` accepting a manifest version of another
+/// series, as for a module still written for the version it upgrades from.
+pub(crate) fn effective_for(
+    module: &Module,
+    version: OdooVersion,
+    any_series: bool,
+) -> Result<Effective, Diagnostic> {
     let manifest = &module.manifest;
     let fail = |kind, snippet: &str| Diagnostic {
         snippet: snippet.to_string(),
@@ -52,7 +62,7 @@ pub(crate) fn effective(module: &Module, version: OdooVersion) -> Result<Effecti
         // An invalid version only matters when Odoo would install the module.
         None if installable => return Err(fail(DiagnosticKind::InvalidVersion, written)),
         _ if !installable => return Err(fail(DiagnosticKind::NotInstallable, "")),
-        Some(adapted) if !version.is_own_series(&adapted) => {
+        Some(adapted) if !any_series && !version.is_own_series(&adapted) => {
             return Err(fail(DiagnosticKind::OtherSeriesVersion, written));
         }
         _ => {}

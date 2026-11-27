@@ -387,6 +387,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pontix-scan"
+version = "0.0.0"
+dependencies = [
+ "pontix-core",
+ "pontix-diff",
+ "pontix-index",
+]
+
+[[package]]
 name = "proc-macro-utils"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

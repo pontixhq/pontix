@@ -6,87 +6,91 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::Installation;
 use pontix_core::storage::{self, Storage};
 use pontix_core::{
     FieldAttrs, FieldName, FieldType, Location, MethodDef, ModelName, ModuleName, Written,
 };
-use pontix_index::Installation;
 
-pub(crate) struct ModelView<'a> {
+/// A model as a whole in one version: everything its class definitions
+/// declare, and what it reaches through other models.
+pub struct ModelView<'a> {
     /// Where the model is first defined.
-    pub(crate) first: Location,
+    pub first: Location,
     /// Whether it has a table: `None` when Pontix cannot tell.
-    pub(crate) has_table: Option<bool>,
+    pub has_table: Option<bool>,
     /// Fields its own definitions declare.
-    pub(crate) fields: BTreeMap<&'a FieldName, FieldView<'a>>,
+    pub fields: BTreeMap<&'a FieldName, FieldView<'a>>,
     /// Methods its own definitions define.
-    pub(crate) methods: BTreeMap<&'a str, MethodView<'a>>,
+    pub methods: BTreeMap<&'a str, MethodView<'a>>,
     /// Fields it only has through another model, with where they are
     /// declared. A model that stops inheriting `mail.thread` loses
     /// `message_ids` although none of its own code changed.
-    pub(crate) inherited_fields: BTreeMap<&'a FieldName, FieldView<'a>>,
+    pub inherited_fields: BTreeMap<&'a FieldName, FieldView<'a>>,
     /// Methods it only has through another model, with where they are
     /// defined.
-    pub(crate) inherited_methods: BTreeMap<&'a str, &'a Location>,
+    pub inherited_methods: BTreeMap<&'a str, &'a Location>,
     /// Fields reachable through `_inherits`, as `email` on `res.users`
     /// through `res.partner`. Their changes are reported on that model.
-    pub(crate) delegated_fields: BTreeMap<&'a FieldName, FieldView<'a>>,
+    pub delegated_fields: BTreeMap<&'a FieldName, FieldView<'a>>,
     /// The other models it inherits from.
-    pub(crate) parents: BTreeSet<ModelName>,
+    pub parents: BTreeSet<ModelName>,
     /// The models it delegates to.
-    delegates: BTreeSet<ModelName>,
+    pub delegates: BTreeSet<ModelName>,
 }
 
 impl<'a> ModelView<'a> {
     /// Whether the field can be reached on the model at all: own,
     /// inherited, or through delegation.
-    pub(crate) fn reaches_field(&self, field: &FieldName) -> bool {
+    pub fn reaches_field(&self, field: &FieldName) -> bool {
         self.field_location(field).is_some() || self.delegated_fields.contains_key(field)
     }
 
     /// A field the model has, own or inherited.
-    pub(crate) fn field(&self, field: &FieldName) -> Option<&FieldView<'a>> {
+    pub fn field(&self, field: &FieldName) -> Option<&FieldView<'a>> {
         self.fields
             .get(field)
             .or_else(|| self.inherited_fields.get(field))
     }
 
     /// Where a field the model has, own or inherited, is declared.
-    pub(crate) fn field_location(&self, field: &FieldName) -> Option<&'a Location> {
+    pub fn field_location(&self, field: &FieldName) -> Option<&'a Location> {
         self.field(field).map(|view| view.first)
     }
 
     /// Where a field the model has keeps its values on this model, whose
     /// table decides as much as the field's own arguments.
-    pub(crate) fn storage(&self, field: &FieldView<'_>) -> Storage {
+    pub fn storage(&self, field: &FieldView<'_>) -> Storage {
         storage::storage(field.field_type, &field.attrs, self.has_table)
     }
 
     /// Whether the model has the method, own or inherited.
-    pub(crate) fn has_method(&self, method: &str) -> bool {
+    pub fn has_method(&self, method: &str) -> bool {
         self.methods.contains_key(method) || self.inherited_methods.contains_key(method)
     }
 }
 
+/// A field as a whole: its first declaration, and what the declarations in
+/// load order make of its type, comodel and arguments.
 #[derive(Clone)]
-pub(crate) struct FieldView<'a> {
+pub struct FieldView<'a> {
     /// The module whose definition declares the field first.
-    pub(crate) owner: &'a ModuleName,
+    pub owner: &'a ModuleName,
     /// The first declaration.
-    pub(crate) first: &'a Location,
+    pub first: &'a Location,
     /// The type of the last declaration, which is the one Odoo keeps.
-    pub(crate) field_type: &'a FieldType,
+    pub field_type: &'a FieldType,
     /// Where that last declaration is.
-    pub(crate) type_at: &'a Location,
+    pub type_at: &'a Location,
     /// The comodel of the last declaration that names one, and where.
-    pub(crate) comodel: Option<(&'a ModelName, &'a Location)>,
+    pub comodel: Option<(&'a ModelName, &'a Location)>,
     /// The arguments every declaration writes, merged in load order.
-    pub(crate) attrs: FieldAttrs,
+    pub attrs: FieldAttrs,
 }
 
 impl FieldView<'_> {
     /// The keys a selection field accepts.
-    pub(crate) fn selection_keys(&self) -> Written<Vec<String>> {
+    pub fn selection_keys(&self) -> Written<Vec<String>> {
         storage::selection_keys(&self.attrs)
     }
 
@@ -101,17 +105,18 @@ impl FieldView<'_> {
     }
 }
 
-pub(crate) struct MethodView<'a> {
+/// A method as a whole: its first definition and every module's own.
+pub struct MethodView<'a> {
     /// The first definition in load order: the method's own signature.
-    pub(crate) first: &'a MethodDef,
+    pub first: &'a MethodDef,
     /// Each module's definition; a module that defines it twice keeps the
     /// later one, as Python does.
-    pub(crate) by_module: BTreeMap<&'a ModuleName, &'a MethodDef>,
+    pub by_module: BTreeMap<&'a ModuleName, &'a MethodDef>,
 }
 
 /// Every model of the installation, built from its class definitions in
 /// load order.
-pub(crate) fn models<'a>(installation: &Installation<'a>) -> BTreeMap<ModelName, ModelView<'a>> {
+pub fn models<'a>(installation: &Installation<'a>) -> BTreeMap<ModelName, ModelView<'a>> {
     let mut views = BTreeMap::new();
     for (name, definitions) in installation.models() {
         let Some(first) = definitions.first() else {

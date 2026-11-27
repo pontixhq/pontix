@@ -11,7 +11,7 @@ use pontix_core::{
     Change, Confidence, Evidence, FieldName, FieldType, ModelName, ModuleName, Rename,
 };
 
-use crate::view::{FieldView, ModelView};
+use pontix_index::registry::{FieldView, ModelView};
 
 /// Finds rename candidates among `changes`, using both versions' models.
 pub(crate) fn renames(

@@ -2,9 +2,11 @@
 
 use std::hash::{Hash, Hasher};
 
+use pontix_core::ApiDecorator;
 use ruff_python_ast::comparable::{ComparableExpr, ComparableStmt};
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{Expr, Stmt, StmtFunctionDef};
+use ruff_text_size::{Ranged, TextSize};
 
 /// Parameter names in declaration order, without the receiver (`self` or
 /// `cls`). `*args` and `**kwargs` keep their stars. A `@staticmethod` has no
@@ -34,6 +36,47 @@ pub(super) fn params(def: &StmtFunctionDef) -> Vec<String> {
         .chain(vararg)
         .chain(keyword_only)
         .chain(kwarg)
+        .collect()
+}
+
+/// The field paths of each `@api.depends`, `@api.onchange` and
+/// `@api.constrains` decorator, with where the decorator starts. Arguments
+/// that are not string literals, such as `*FIELDS` or a lambda, are left out.
+pub(super) fn field_paths(def: &StmtFunctionDef) -> Vec<(ApiDecorator, Vec<String>, TextSize)> {
+    def.decorator_list
+        .iter()
+        .filter_map(|decorator| {
+            let Expr::Call(call) = &decorator.expression else {
+                return None;
+            };
+            let Expr::Attribute(attribute) = &*call.func else {
+                return None;
+            };
+            let from_api = match &*attribute.value {
+                Expr::Name(module) => module.id.as_str() == "api",
+                Expr::Attribute(module) => module.attr.as_str() == "api",
+                _ => false,
+            };
+            let kind = match attribute.attr.as_str() {
+                "depends" => ApiDecorator::Depends,
+                "onchange" => ApiDecorator::Onchange,
+                "constrains" => ApiDecorator::Constrains,
+                _ => return None,
+            };
+            if !from_api {
+                return None;
+            }
+            let paths = call
+                .arguments
+                .args
+                .iter()
+                .filter_map(|argument| match argument {
+                    Expr::StringLiteral(literal) => Some(literal.value.to_str().to_string()),
+                    _ => None,
+                })
+                .collect();
+            Some((kind, paths, decorator.start()))
+        })
         .collect()
 }
 
@@ -161,6 +204,37 @@ mod tests {
             Some(Stmt::FunctionDef(def)) => def,
             other => panic!("expected a function, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reads_field_paths_from_api_decorators() {
+        let def = method(&[
+            "@api.depends('order_id.partner_id', 'amount', *EXTRA)",
+            "@api.onchange('partner_id')",
+            "@odoo.api.constrains('date_start', 'date_end')",
+            "@api.depends_context('company')",
+            "@other.depends('ignored')",
+            "def _compute(self): pass",
+        ]);
+        let found: Vec<(ApiDecorator, Vec<String>)> = field_paths(&def)
+            .into_iter()
+            .map(|(kind, paths, _)| (kind, paths))
+            .collect();
+        let strings = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            [
+                (
+                    ApiDecorator::Depends,
+                    strings(&["order_id.partner_id", "amount"])
+                ),
+                (ApiDecorator::Onchange, strings(&["partner_id"])),
+                (
+                    ApiDecorator::Constrains,
+                    strings(&["date_start", "date_end"])
+                ),
+            ]
+        );
     }
 
     #[test]

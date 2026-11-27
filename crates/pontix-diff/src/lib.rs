@@ -8,7 +8,6 @@
 #![forbid(unsafe_code)]
 
 mod rename;
-mod view;
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
@@ -17,7 +16,7 @@ use std::path::Path;
 use pontix_core::{Change, ChangeSet, FieldName, Location, ModelName, Storage, Written};
 use pontix_index::Installation;
 
-use crate::view::{FieldView, MethodView, ModelView, models};
+use pontix_index::registry::{FieldView, MethodView, ModelView, models};
 
 /// Every change between `source` and `target`, ordered by module, then by
 /// model, then by field and method name.
@@ -333,6 +332,7 @@ mod tests {
             name: name.to_string(),
             params: params.iter().map(|p| p.to_string()).collect(),
             calls_super: false,
+            field_paths: Vec::new(),
             fingerprint,
             location: at("models.py", line),
         }

@@ -21,8 +21,8 @@ pub use manifest::{AutoInstall, Manifest, ModuleName};
 pub use resolve::ModelKind;
 pub use storage::Storage;
 pub use symbol::{
-    Delegation, FieldAttrs, FieldDef, FieldName, Inherit, Location, MethodDef, ModelBase, ModelDef,
-    ModelName, Written,
+    ApiDecorator, Delegation, FieldAttrs, FieldDef, FieldName, FieldPaths, Inherit, Location,
+    MethodDef, ModelBase, ModelDef, ModelName, Written,
 };
 pub use version::OdooVersion;
 

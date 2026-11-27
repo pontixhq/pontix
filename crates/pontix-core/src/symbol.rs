@@ -149,6 +149,30 @@ pub struct FieldDef {
     pub location: Location,
 }
 
+/// An `odoo.api` decorator that names field paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ApiDecorator {
+    /// `@api.depends(...)`: the fields a computed value depends on.
+    Depends,
+    /// `@api.onchange(...)`: the fields whose change in a form runs it.
+    Onchange,
+    /// `@api.constrains(...)`: the fields whose change runs the check.
+    Constrains,
+}
+
+/// The field paths one `@api` decorator names, such as
+/// `@api.depends("order_id.partner_id", "amount")`. Only string literals
+/// are kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldPaths {
+    /// Which decorator.
+    pub decorator: ApiDecorator,
+    /// The dotted paths, in order.
+    pub paths: Vec<String>,
+    /// Where the decorator is.
+    pub location: Location,
+}
+
 /// A method defined on a model class.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodDef {
@@ -159,6 +183,9 @@ pub struct MethodDef {
     pub params: Vec<String>,
     /// True when the method body calls `super()`.
     pub calls_super: bool,
+    /// Field paths its `@api.depends`, `@api.onchange` and `@api.constrains`
+    /// decorators name.
+    pub field_paths: Vec<FieldPaths>,
     /// What the method does, as a fingerprint of its decorators, parameter
     /// names and defaults, and body. Formatting, comments, the docstring and
     /// type annotations do not count. Two definitions with the same

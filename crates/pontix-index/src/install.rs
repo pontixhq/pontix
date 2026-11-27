@@ -13,7 +13,7 @@ use pontix_core::{
     Diagnostic, DiagnosticKind, ModelDef, ModelKind, ModelName, ModuleName, OdooVersion,
 };
 
-use crate::effective::{Effective, effective};
+use crate::effective::{Effective, effective, effective_for};
 use crate::files::whole_file;
 use crate::scan::{Addons, Module};
 
@@ -62,6 +62,20 @@ impl<'a> Installation<'a> {
     }
 }
 
+/// How to install, beyond which modules: the countries of the companies,
+/// which decide country-specific `auto_install` modules, and the modules
+/// being upgraded.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InstallOptions<'o> {
+    /// Country codes of the companies, as in `res.country.code`.
+    pub company_countries: &'o [String],
+    /// Modules still written for another version, which Pontix checks for
+    /// the upgrade: they are installed although their manifest version is of
+    /// another series and although a dependency cannot be installed. That
+    /// dependency is still reported on the module.
+    pub upgrading: &'o [ModuleName],
+}
+
 /// Installs `requested` the way Odoo would, on the modules `addons` found,
 /// for a database whose companies are in `company_countries` (country codes
 /// such as `id` or `fr`). Country-specific `auto_install` modules, like most
@@ -71,9 +85,26 @@ pub fn install<'a>(
     requested: &[ModuleName],
     company_countries: &[String],
 ) -> Installation<'a> {
+    install_with(
+        addons,
+        requested,
+        &InstallOptions {
+            company_countries,
+            upgrading: &[],
+        },
+    )
+}
+
+/// [`install`], with the modules being upgraded installed as far as they go.
+pub fn install_with<'a>(
+    addons: &'a Addons,
+    requested: &[ModuleName],
+    options: &InstallOptions<'_>,
+) -> Installation<'a> {
     let mut installer = Installer {
         version: addons.version,
-        company_countries,
+        company_countries: options.company_countries,
+        upgrading: options.upgrading,
         by_name: addons.modules.iter().map(|m| (m.name.clone(), m)).collect(),
         state: HashMap::new(),
         installed: Vec::new(),
@@ -116,6 +147,7 @@ enum Refusal {
 struct Installer<'a, 'c> {
     version: OdooVersion,
     company_countries: &'c [String],
+    upgrading: &'c [ModuleName],
     by_name: HashMap<ModuleName, &'a Module>,
     state: HashMap<ModuleName, State>,
     installed: Vec<(&'a Module, Effective)>,
@@ -147,7 +179,8 @@ impl<'a> Installer<'a, '_> {
     }
 
     fn add_module(&mut self, module: &'a Module) -> Result<(), Refusal> {
-        let effective = match effective(module, self.version) {
+        let upgrading = self.upgrading.contains(&module.name);
+        let effective = match effective_for(module, self.version, upgrading) {
             Ok(effective) => effective,
             Err(diagnostic) => {
                 self.diagnostics.push(diagnostic);
@@ -165,7 +198,10 @@ impl<'a> Installer<'a, '_> {
                     snippet: dependency.to_string(),
                     ..whole_file(kind, &module.manifest_path)
                 });
-                return Err(Refusal::NotInstallable);
+                // A module being upgraded is checked as far as it goes.
+                if !upgrading {
+                    return Err(Refusal::NotInstallable);
+                }
             }
         }
         self.installed.push((module, effective));
@@ -415,6 +451,35 @@ mod tests {
                 .location
                 .file
                 .ends_with("needs_old/__manifest__.py")
+        );
+    }
+
+    #[test]
+    fn modules_being_upgraded_install_as_far_as_they_go() {
+        let mut modules = core(OdooVersion::V19).modules;
+        modules.push(module(
+            "custom_sale",
+            &["sale", "sale_legacy"],
+            AutoInstall::No,
+        ));
+        modules.last_mut().expect("just pushed").manifest.version = Some("18.0.1.0.0".to_string());
+        let addons = addons(OdooVersion::V19, modules);
+        let requested = names(&["custom_sale"]);
+        let refused = install_for(&addons, &requested);
+        assert_eq!(order(&refused), ["base"]);
+
+        let upgrading = install_with(
+            &addons,
+            &requested,
+            &InstallOptions {
+                company_countries: &[],
+                upgrading: &requested,
+            },
+        );
+        assert_eq!(order(&upgrading), ["base", "sale", "custom_sale"]);
+        assert_eq!(
+            reported(&upgrading),
+            [(DiagnosticKind::MissingDependency, "sale_legacy")]
         );
     }
 

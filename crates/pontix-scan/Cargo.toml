@@ -1,0 +1,18 @@
+[package]
+name = "pontix-scan"
+description = "Finds what custom Odoo modules rely on in core, and what of it an upgrade breaks."
+license-file = "../../LICENSE-FSL.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pontix-core = { path = "../pontix-core" }
+pontix-diff = { path = "../pontix-diff" }
+pontix-index = { path = "../pontix-index" }
