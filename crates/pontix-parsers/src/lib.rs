@@ -11,4 +11,4 @@ pub mod python;
 mod source;
 
 pub use manifest::{ManifestFile, parse_manifest};
-pub use python::{PythonFile, parse_python};
+pub use python::{Import, PythonFile, parse_python};

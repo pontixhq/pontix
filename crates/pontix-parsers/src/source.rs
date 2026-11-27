@@ -23,6 +23,11 @@ impl<'a> SourceFile<'a> {
         }
     }
 
+    /// The source text of `range`, exactly as written.
+    pub(crate) fn text(&self, range: TextRange) -> &'a str {
+        &self.text[range]
+    }
+
     pub(crate) fn location(&self, offset: TextSize) -> Location {
         // Saturates instead of failing: a source file cannot realistically
         // have more than u32::MAX lines.
@@ -38,7 +43,7 @@ impl<'a> SourceFile<'a> {
         Diagnostic {
             kind,
             location: self.location(range.start()),
-            snippet: self.text[range].to_string(),
+            snippet: self.text(range).to_string(),
         }
     }
 

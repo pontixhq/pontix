@@ -21,6 +21,10 @@ pub enum DiagnosticKind {
     UnrecognizedModelClass,
     /// A class attribute looks like a field but is not written `fields.X(...)`.
     UnrecognizedField,
+    /// A model class is defined inside an `if`, loop, `try` or `with` block
+    /// at module level. Whether, and how many times, it is defined depends on
+    /// running code, so Pontix does not read it.
+    NestedModelClass,
     /// A relational field names its comodel with something other than a
     /// string literal. The field itself is still read.
     UnrecognizedComodel,
@@ -31,6 +35,20 @@ pub enum DiagnosticKind {
     /// A manifest key Pontix reads holds a value of the wrong shape, for
     /// example `'depends': 'sale'` instead of a list.
     UnrecognizedManifestValue,
+    /// A file could not be read: an I/O error, or it is not UTF-8 text.
+    UnreadableFile,
+    /// A file is larger than Pontix reads, which protects against inputs
+    /// built to exhaust memory.
+    FileTooLarge,
+    /// A path resolves, through a symbolic link, to somewhere outside the
+    /// addons path being scanned. Pontix does not follow it.
+    OutsideRoot,
+    /// An import inside a module points to a file or package that does not
+    /// exist. Python raises `ImportError`, so Odoo cannot load the module.
+    UnresolvedImport,
+    /// A module with the same name was already found in an earlier addons
+    /// path. Odoo uses the first one; this one is ignored.
+    DuplicateModule,
 }
 
 /// Something a parser could not read, with the source text exactly as written.
@@ -40,6 +58,7 @@ pub struct Diagnostic {
     pub kind: DiagnosticKind,
     /// Where it is.
     pub location: Location,
-    /// The source text exactly as written, unchanged.
+    /// The source text exactly as written, unchanged. Empty for a diagnostic
+    /// about a whole file or directory, whose location is then its line 1.
     pub snippet: String,
 }

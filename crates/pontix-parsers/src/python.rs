@@ -6,6 +6,7 @@
 
 mod field;
 mod method;
+mod module_level;
 
 use std::path::Path;
 
@@ -13,11 +14,13 @@ use pontix_core::{
     Delegation, Diagnostic, DiagnosticKind, FieldDef, FieldName, Inherit, MethodDef, ModelDef,
     ModelName,
 };
+use ruff_python_ast::visitor::{Visitor, walk_stmt};
 use ruff_python_ast::{Expr, ExprList, ExprName, ExprTuple, Stmt, StmtClassDef};
 use ruff_python_parser::parse_module;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use self::field::{Comodel, Field};
+pub use self::module_level::Import;
 use crate::source::SourceFile;
 
 /// Classes from `odoo.models` that make a subclass an Odoo model. Core uses
@@ -43,6 +46,12 @@ const MODEL_ATTRIBUTES: [(&str, Attribute); 3] = [
 pub struct PythonFile {
     /// Model classes, in source order.
     pub models: Vec<ModelDef>,
+    /// Imports that run when the file is imported, in source order.
+    pub imports: Vec<Import>,
+    /// Names bound at module level when the file is imported: assignments,
+    /// functions, classes and import aliases. `from . import x` may import
+    /// such a name from a package's `__init__.py` instead of a file.
+    pub bound_names: Vec<String>,
     /// Everything that could not be read, in source order.
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -51,7 +60,8 @@ pub struct PythonFile {
 ///
 /// `file` is only recorded in locations; the file is never opened here.
 /// A file that is not valid Python yields a single
-/// [`DiagnosticKind::SyntaxError`] and no models, because Odoo cannot import it.
+/// [`DiagnosticKind::SyntaxError`] and no models or imports, because Odoo
+/// cannot import it.
 pub fn parse_python(file: &Path, source: &str) -> PythonFile {
     let mut reader = Reader {
         source: SourceFile::new(file, source),
@@ -59,9 +69,14 @@ pub fn parse_python(file: &Path, source: &str) -> PythonFile {
     };
     match parse_module(source) {
         Ok(parsed) => {
+            let module_level = module_level::module_level(&reader.source, &parsed.syntax().body);
+            reader.out.imports = module_level.imports;
+            reader.out.bound_names = module_level.bound_names;
             for stmt in &parsed.syntax().body {
-                if let Stmt::ClassDef(class) = stmt {
-                    reader.class(class);
+                match stmt {
+                    Stmt::ClassDef(class) => reader.class(class),
+                    Stmt::FunctionDef(_) => {}
+                    compound => reader.nested_classes(compound),
                 }
             }
         }
@@ -160,6 +175,20 @@ impl Reader<'_> {
         self.out.models.push(model);
     }
 
+    /// Reports model classes defined inside a module-level compound
+    /// statement, such as `for name in MODELS: class NewModel(models.Model)`
+    /// in `test_import_export` (Odoo 19).
+    fn nested_classes(&mut self, stmt: &Stmt) {
+        let mut finder = NestedClasses {
+            reader: self,
+            found: Vec::new(),
+        };
+        finder.visit_stmt(stmt);
+        for offset in finder.found {
+            self.report_line(DiagnosticKind::NestedModelClass, offset);
+        }
+    }
+
     /// Adds `target = value` to the model when the value is a field.
     fn field(&mut self, model: &mut ModelDef, stmt: &Stmt, target: &ExprName, value: &Expr) {
         let Some(declaration) = field::field(value, model.name.as_ref()) else {
@@ -231,6 +260,32 @@ fn field_assignment(stmt: &Stmt) -> Option<(&ExprName, &Expr)> {
     match target {
         Expr::Name(name) if !name.id.as_str().starts_with('_') => Some((name, value)),
         _ => None,
+    }
+}
+
+/// Finds model classes inside a compound statement; functions are skipped
+/// because their bodies only run when called.
+struct NestedClasses<'r, 'a> {
+    reader: &'r Reader<'a>,
+    found: Vec<TextSize>,
+}
+
+impl<'s> Visitor<'s> for NestedClasses<'_, '_> {
+    fn visit_stmt(&mut self, stmt: &'s Stmt) {
+        match stmt {
+            Stmt::ClassDef(class) => {
+                let is_model = class.arguments.as_deref().is_some_and(|arguments| {
+                    arguments.args.iter().any(|base| {
+                        is_model_base(base) || self.reader.is_model_class_in_this_file(base)
+                    })
+                });
+                if is_model {
+                    self.found.push(class.name.range.start());
+                }
+            }
+            Stmt::FunctionDef(_) => {}
+            other => walk_stmt(self, other),
+        }
     }
 }
 
@@ -692,6 +747,106 @@ mod tests {
                     "partner_id = fields.Many2one(PARTNER)"
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn collects_imports_that_run_on_import() {
+        let file = parse(&[
+            "from . import models, wizard",
+            "from .models import sale_order as so",
+            "from .. import tools",
+            "import odoo.addons.sale.models, logging",
+            "try:",
+            "    from . import optional",
+            "except ImportError:",
+            "    from .vendor import fallback",
+            "def helper():",
+            "    from . import lazy",
+            "class Thing:",
+            "    from . import inside_class",
+        ]);
+        let seen: Vec<(u32, Option<&str>, Vec<&str>, String)> = file
+            .imports
+            .iter()
+            .map(|import| {
+                (
+                    import.level,
+                    import.module.as_deref(),
+                    import.names.iter().map(String::as_str).collect(),
+                    import.location.to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (1, None, vec!["models", "wizard"], format!("{FILE}:1")),
+                (1, Some("models"), vec!["sale_order"], format!("{FILE}:2")),
+                (2, None, vec!["tools"], format!("{FILE}:3")),
+                (
+                    0,
+                    Some("odoo.addons.sale.models"),
+                    vec![],
+                    format!("{FILE}:4")
+                ),
+                (0, Some("logging"), vec![], format!("{FILE}:4")),
+                (1, None, vec!["optional"], format!("{FILE}:6")),
+            ]
+        );
+        assert_eq!(
+            file.imports[1].statement,
+            "from .models import sale_order as so"
+        );
+        assert_eq!(
+            file.bound_names,
+            [
+                "models", "wizard", "so", "tools", "odoo", "logging", "optional", "helper", "Thing"
+            ]
+        );
+    }
+
+    #[test]
+    fn bound_names_cover_assignments_and_unpacking() {
+        let file = parse(&[
+            "NOTICE = 'deprecated'",
+            "a, (b, *rest) = 1, (2, 3)",
+            "TIMEOUT: int = 5",
+            "declared_only: int",
+            "if True:",
+            "    FLAG = True",
+        ]);
+        assert_eq!(
+            file.bound_names,
+            ["NOTICE", "a", "b", "rest", "TIMEOUT", "FLAG"]
+        );
+    }
+
+    #[test]
+    fn model_classes_in_compound_statements_are_reported_not_read() {
+        let file = parse(&[
+            "for name, field in MODELS:",
+            "    class NewModel(models.Model):",
+            "        _name = f'export.{name}'",
+            "if DEBUG:",
+            "    class Helper:",
+            "        pass",
+            "def factory():",
+            "    class Built(models.Model):",
+            "        pass",
+        ]);
+        assert!(file.models.is_empty());
+        let seen: Vec<(DiagnosticKind, &str)> = file
+            .diagnostics
+            .iter()
+            .map(|d| (d.kind, d.snippet.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [(
+                DiagnosticKind::NestedModelClass,
+                "    class NewModel(models.Model):"
+            )]
         );
     }
 }

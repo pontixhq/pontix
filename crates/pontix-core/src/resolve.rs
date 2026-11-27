@@ -18,6 +18,17 @@ pub enum OdooVersion {
     V19,
 }
 
+impl OdooVersion {
+    /// Manifest file names this version looks for in a module directory, in
+    /// the order it tries them. Odoo 19 dropped `__openerp__.py`.
+    pub fn manifest_file_names(self) -> &'static [&'static str] {
+        match self {
+            Self::V18 => &["__manifest__.py", "__openerp__.py"],
+            Self::V19 => &["__manifest__.py"],
+        }
+    }
+}
+
 /// How a model class relates to existing models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelKind {
