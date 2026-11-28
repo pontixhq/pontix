@@ -103,7 +103,10 @@ fn reports_findings_as_text_with_relative_paths() {
         "{text}"
     );
     assert_eq!(text.matches("PTX-M003").count(), 1, "{text}");
-    assert!(text.contains("Not checked: js, view expressions"), "{text}");
+    assert!(
+        text.contains("Not checked: js, qweb outside reports, untyped python."),
+        "{text}"
+    );
     let root = trees.dir.path().to_string_lossy().into_owned();
     assert!(!text.contains(&root), "absolute paths leak into the report");
 }

@@ -156,6 +156,14 @@ impl<'a> Views<'a> {
         self.combined(root, limit, Some(id), in_scope, 0)
     }
 
+    /// The architecture of a view with every extension of the modules in
+    /// scope applied, as Odoo renders it: for a QWeb template, what a
+    /// `t-call` to it runs. `None` when that cannot be told.
+    pub fn arch(&self, id: &str, in_scope: &dyn Fn(&ModuleName) -> bool) -> Option<Element> {
+        let root = self.root(id)?;
+        self.combined(root, None, None, in_scope, 0)
+    }
+
     /// The view whose architecture an extension chain starts from: the
     /// first one up the chain that is not an extension.
     fn root(&self, id: &str) -> Option<&str> {

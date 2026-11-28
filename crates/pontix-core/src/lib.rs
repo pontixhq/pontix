@@ -21,7 +21,7 @@ pub mod version;
 pub use arch::Element;
 pub use change::{Change, ChangeSet, Confidence, Evidence, Rename};
 pub use code::{CodeRef, CodeRoot, CodeUse};
-pub use data::{ArchField, DataFile, Record, RefKind, View, XmlRef};
+pub use data::{ArchField, DataFile, Record, RefKind, Report, View, XmlRef};
 pub use diagnostic::{Diagnostic, DiagnosticKind};
 pub use field_type::FieldType;
 pub use finding::{Basis, Category, CoreBasis, Finding, PtxCode, Severity, Suggestion};

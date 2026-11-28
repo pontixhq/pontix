@@ -17,6 +17,7 @@ use pontix_index::{Framework, Installation, Lookup, Module};
 use crate::path::{Scope, Walk, lookup, walk};
 
 mod code;
+mod qweb;
 use crate::{Evidence, Issue, ModelUse, PathUse, Problem, Renamed, Since};
 
 /// Where Odoo 19 names a class's model: only a string `_inherit` becomes
@@ -150,6 +151,7 @@ pub(crate) fn check(versions: &Versions<'_, '_, '_>) -> Vec<Issue> {
             checker.class(def);
         }
         checker.data(module);
+        checker.qweb(module);
         checker.code(module);
     }
     issues
@@ -392,7 +394,10 @@ impl Checker<'_, '_, '_, '_> {
                 .chain(std::iter::once(&field.name))
                 .map(FieldName::as_str)
                 .collect();
-            let how = PathUse::View(id.to_string());
+            let how = match &field.attribute {
+                Some(attribute) => PathUse::ViewExpression(id.to_string(), attribute.clone()),
+                None => PathUse::View(id.to_string()),
+            };
             self.path(&model, &path.join("."), how, &field.location);
         }
     }
@@ -655,6 +660,12 @@ impl Checker<'_, '_, '_, '_> {
             return;
         };
         let worked = walk(&source.models, self.scope.0, model, path) == Walk::Reaches;
+        // Odoo installs the source version, so a name of a view expression
+        // it does not know there is one Pontix cannot see, such as a field
+        // a mixin adds at run time: only what the upgrade removes counts.
+        if !worked && matches!(how, PathUse::ViewExpression(..) | PathUse::Qweb(..)) {
+            return;
+        }
         let existing = source
             .models
             .get(&on)

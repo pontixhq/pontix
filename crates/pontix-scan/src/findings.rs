@@ -14,12 +14,12 @@ use crate::{ApiUse, Issue, ModelUse, PathUse, Problem, Scan, Since};
 /// finding never reads as safe.
 pub const NOT_COVERED: &[&str] = &[
     "js",
-    "view_expressions",
-    "qweb",
+    // QWeb outside reports (website pages, mail templates, portal), and
+    // report variables Pontix cannot type.
+    "qweb_outside_reports",
     // Python code whose model Pontix cannot tell, such as a method
     // parameter.
     "untyped_python",
-    "csv",
 ];
 
 /// The findings of a scan, ready for people and tools.
@@ -438,6 +438,8 @@ fn path_use(how: &PathUse) -> String {
         PathUse::Onchange(method) => format!("@api.onchange of {method}"),
         PathUse::Constrains(method) => format!("@api.constrains of {method}"),
         PathUse::View(view) => format!("view {view}"),
+        PathUse::ViewExpression(view, attribute) => format!("{attribute}= in view {view}"),
+        PathUse::Qweb(template, directive) => format!("{directive}= in template {template}"),
         PathUse::RecordValue(record) => format!("a value of record {record}"),
         PathUse::Code(how) => format!("Python code, {}", code_use(*how)),
         PathUse::Test(how) => format!("tests, {}", code_use(*how)),

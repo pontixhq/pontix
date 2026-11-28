@@ -8,7 +8,7 @@ use pontix_core::{
     CodeRef, DataFile, Diagnostic, DiagnosticKind, Manifest, ModelDef, ModuleName, OdooVersion,
     XmlRef,
 };
-use pontix_parsers::{parse_manifest, parse_xml};
+use pontix_parsers::{parse_csv, parse_manifest, parse_xml};
 
 use crate::bases;
 use crate::files::{Root, whole_file};
@@ -223,8 +223,8 @@ fn scan_module(
     });
 }
 
-/// Reads the XML files the manifest lists in `data` and `demo`. Other files,
-/// such as CSV, are not read. A path that leaves the module directory is not
+/// Reads the XML and CSV files the manifest lists in `data` and `demo`.
+/// Other files, such as SQL, are not read. A path that leaves the module directory is not
 /// followed; one Odoo cannot read is reported, since Odoo would fail to
 /// install the module.
 fn data_files(
@@ -243,14 +243,21 @@ fn data_files(
             diagnostics.push(whole_file(DiagnosticKind::OutsideRoot, &dir.join(relative)));
             continue;
         }
-        if relative
+        let csv = match relative
             .extension()
-            .is_none_or(|extension| extension != "xml")
+            .and_then(|extension| extension.to_str())
         {
-            continue;
-        }
+            Some("xml") => false,
+            Some("csv") => true,
+            _ => continue,
+        };
         let path = dir.join(relative);
         match root.read(&path) {
+            Ok(text) if csv => {
+                let parsed = parse_csv(&path, &text);
+                diagnostics.extend(parsed.diagnostics);
+                files.push((path, parsed.data));
+            }
             Ok(text) => {
                 let parsed = parse_xml(&path, &text);
                 diagnostics.extend(parsed.diagnostics);
@@ -352,9 +359,13 @@ mod tests {
         let read: Vec<PathBuf> = module.data.iter().map(|(path, _)| path.clone()).collect();
         assert_eq!(
             relative(&tree, &read),
-            ["sale_custom/views/sale.xml", "sale_custom/demo/demo.xml"]
+            [
+                "sale_custom/security/ir.model.access.csv",
+                "sale_custom/views/sale.xml",
+                "sale_custom/demo/demo.xml"
+            ]
         );
-        assert_eq!(module.data[0].1.records[0].model.as_str(), "res.partner");
+        assert_eq!(module.data[1].1.records[0].model.as_str(), "res.partner");
         assert_eq!(
             kinds(&addons),
             [DiagnosticKind::OutsideRoot, DiagnosticKind::UnreadableFile]

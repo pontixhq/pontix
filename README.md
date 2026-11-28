@@ -4,7 +4,8 @@ Pontix analyses custom Odoo modules and predicts what will break, and why,
 when you upgrade to a new Odoo version, with evidence from the target Odoo
 source.
 
-> Status: early development (Phase 1). Not ready for use.
+> Status: early development. Being tested on real migrations before a
+> first release.
 
 ## Workspace
 
@@ -46,6 +47,10 @@ Each finding has a PTX code, a severity, where the custom module refers to
 core, and where core declares it in each version. Exit codes: 0 done, 1 a
 finding reached `--fail-on`, 2 bad input. A report always lists what Pontix
 does not check yet; no finding does not mean the upgrade is safe.
+
+The full guide — options, how modules and dependencies are checked, the
+text and JSON reports, every PTX code, and the known limitations — is in
+[docs/usage.md](docs/usage.md).
 
 ## Development
 

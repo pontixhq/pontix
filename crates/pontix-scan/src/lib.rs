@@ -117,6 +117,12 @@ pub enum PathUse {
     Constrains(String),
     /// A `<field>` of the view with this external id.
     View(String),
+    /// An expression of the view with this external id, in this
+    /// attribute, such as `invisible`.
+    ViewExpression(String, String),
+    /// A QWeb expression the template with this external id renders, in
+    /// this directive, such as `t-field`.
+    Qweb(String, String),
     /// A value the record with this external id sets in a data file.
     RecordValue(String),
     /// The module's Python code.

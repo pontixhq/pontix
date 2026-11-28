@@ -506,6 +506,7 @@ fn data(
             models: Vec::new(),
             refs,
             xmlids: Vec::new(),
+            reports: Vec::new(),
         },
     )
 }
@@ -531,6 +532,7 @@ fn view(
                     name: FieldName::new(*field),
                     within: Vec::new(),
                     locator: false,
+                    attribute: None,
                     location: at(file, *at_line),
                 })
                 .collect(),
@@ -1554,4 +1556,90 @@ fn data_files_that_need_demo_records_are_warnings() {
         .find(|finding| finding.code == PtxCode::R602)
         .expect("an R602 finding");
     assert_eq!(finding.severity, Severity::Warning);
+}
+
+#[test]
+fn fields_a_report_template_reads_are_followed_from_the_report_model() {
+    let xml = |file: &str, body: &str| {
+        let parsed = pontix_parsers::parse_xml(file.as_ref(), &format!("<odoo>{body}</odoo>"));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        (PathBuf::from(file), parsed.data)
+    };
+    let core = xml(
+        "sale/report.xml",
+        "<record id='action_report_order' model='ir.actions.report'>\
+           <field name='model'>sale.order</field>\
+           <field name='report_name'>sale.report_order</field>\
+         </record>\
+         <template id='report_order'>\
+           <t t-foreach='docs' t-as='doc'><t t-call='sale.report_order_document'/></t>\
+         </template>\
+         <template id='report_order_document'><div class='page'><span t-field='doc.partner_id'/></div></template>",
+    );
+    let mine = xml(
+        "custom_sale/report.xml",
+        "<template id='report_order_document' inherit_id='sale.report_order_document'>\
+           <xpath expr=\"//div[@class='page']\" position='inside'>\
+             <span t-field='doc.note'/>\n\
+             <span t-esc='doc.partner_id.fax or doc.amount'/>\n\
+             <t t-set='partner' t-value='doc.partner_id'/>\n\
+             <span t-field='partner.fax'/>\n\
+             <span t-attf-class='state-{{ doc.note }}'/>\n\
+             <span t-esc='doc._legacy_label()'/>\n\
+             <span t-esc='other.note'/>\n\
+           </xpath>\
+         </template>",
+    );
+    let (mut source, mut target) = (source(), target());
+    source.modules[1].data = vec![core.clone()];
+    target.modules[1].data = vec![core];
+    for addons in [&mut source, &mut target] {
+        for name in ["ir.ui.view", "ir.actions.report"] {
+            addons.modules[0].models.push(model(
+                "base/models.py",
+                name,
+                Inherit::Absent,
+                vec![],
+                vec![],
+            ));
+        }
+        let custom = addons
+            .modules
+            .iter_mut()
+            .find(|module| module.name.as_str() == "custom_sale")
+            .expect("the custom module");
+        custom.data = vec![mine.clone()];
+    }
+    let scan = scan(&source, &target, &[ModuleName::new("custom_sale")], &[]);
+    let read: Vec<(String, String, &str)> = scan
+        .issues
+        .iter()
+        .filter_map(|issue| match &issue.problem {
+            Problem::FieldGone {
+                model,
+                path,
+                how: PathUse::Qweb(template, directive),
+                ..
+            } => {
+                assert_eq!(template, "sale.report_order_document");
+                Some((model.to_string(), path.clone(), directive.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    // `amount` is still there (the field gone is reported on its model), a method is not a field, and `other` holds
+    // nothing Pontix knows.
+    assert_eq!(
+        read,
+        [
+            ("sale.order".to_string(), "note".to_string(), "t-field"),
+            (
+                "res.partner".to_string(),
+                "partner_id.fax".to_string(),
+                "t-esc"
+            ),
+            ("res.partner".to_string(), "fax".to_string(), "t-field"),
+            ("sale.order".to_string(), "note".to_string(), "t-attf-class"),
+        ]
+    );
 }

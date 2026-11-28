@@ -17,6 +17,20 @@ pub struct DataFile {
     /// External ids that `ir.model.data._update_xmlids` gives records made
     /// elsewhere, such as `stock.stock_location_stock`, as written.
     pub xmlids: Vec<(String, Location)>,
+    /// QWeb reports (`ir.actions.report` records): which template renders
+    /// records of which model.
+    pub reports: Vec<Report>,
+}
+
+/// A QWeb report: `docs` in its template are records of `model`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// `<field name="model">`.
+    pub model: ModelName,
+    /// `<field name="report_name">`: the template, as `module.xmlid`.
+    pub template: String,
+    /// Where the record is.
+    pub location: Location,
 }
 
 /// A record the file creates or updates.
@@ -73,6 +87,10 @@ pub struct ArchField {
     /// Whether it only locates a place in the inherited view
     /// (`<field name="partner_id" position="after">`).
     pub locator: bool,
+    /// The attribute whose expression names it, such as `invisible` or
+    /// `domain`: Odoo checks those names against the model too. `None` for
+    /// a `<field>` element.
+    pub attribute: Option<String>,
     /// Where the element is.
     pub location: Location,
 }

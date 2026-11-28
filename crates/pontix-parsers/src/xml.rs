@@ -9,7 +9,7 @@ use std::path::Path;
 
 use pontix_core::{
     ArchField, DataFile, Diagnostic, DiagnosticKind, Element, FieldName, Location, ModelName,
-    Record, RefKind, View, XmlRef,
+    Record, RefKind, Report, View, XmlRef,
 };
 use roxmltree::{Document, Node, ParsingOptions};
 use ruff_python_ast::Expr;
@@ -221,11 +221,20 @@ impl Reader<'_> {
         let model = ModelName::new(model);
         let mut fields = Vec::new();
         let mut view = (model.as_str() == "ir.ui.view").then(View::default);
+        let mut report: (Option<ModelName>, Option<String>) = (None, None);
         for field in node.children().filter(|child| child.has_tag_name("field")) {
             let Some(name) = field.attribute("name") else {
                 continue;
             };
             fields.push((FieldName::new(name), self.location(field)));
+            if model.as_str() == "ir.actions.report" {
+                let text = field.text().map(str::trim).filter(|text| !text.is_empty());
+                match name {
+                    "model" => report.0 = text.map(ModelName::new),
+                    "report_name" => report.1 = text.map(str::to_string),
+                    _ => {}
+                }
+            }
             let Some(view) = view.as_mut() else {
                 continue;
             };
@@ -243,6 +252,13 @@ impl Reader<'_> {
                 }
                 _ => {}
             }
+        }
+        if let (Some(report_model), Some(template)) = report {
+            self.out.data.reports.push(Report {
+                model: report_model,
+                template,
+                location: self.location(node),
+            });
         }
         self.out.data.records.push(Record {
             id: node.attribute("id").map(str::to_string),
@@ -311,6 +327,7 @@ impl Reader<'_> {
             if self.deep(node, depth) {
                 continue;
             }
+            self.expressions(node, &within, &mut found);
             let inner = match node.tag_name().name() {
                 "field" => match node.attribute("name") {
                     Some(name) => {
@@ -320,6 +337,7 @@ impl Reader<'_> {
                             name: name.clone(),
                             within: within.clone(),
                             locator: position.is_some(),
+                            attribute: None,
                             location: self.location(node),
                         });
                         // Elements inside a field are its embedded views,
@@ -348,6 +366,78 @@ impl Reader<'_> {
             }
         }
         found
+    }
+
+    /// The fields the expressions of an element name, as Odoo's view
+    /// validation reads them: the names in `invisible`, `readonly`,
+    /// `required`, `column_invisible` and `context`, and in a domain both
+    /// the fields it filters on (of the field's comodel, for a `<field
+    /// domain>`) and the names its values use. An `<attribute>` of an
+    /// inheriting view counts for the attribute it sets. Expressions that
+    /// do not parse are left alone.
+    fn expressions(&self, node: Node<'_, '_>, within: &[FieldName], found: &mut Vec<ArchField>) {
+        let location = self.location(node);
+        let mut push = |names: Vec<String>, comodel: Option<&FieldName>, attribute: &str| {
+            for name in names {
+                // `parent.x` is a field of the record holding this one.
+                let (within, name) = match name.strip_prefix("parent.") {
+                    Some(rest) => match within.split_last() {
+                        Some((_, outer)) => (outer.to_vec(), rest.to_string()),
+                        None => continue,
+                    },
+                    None => {
+                        let mut path = within.to_vec();
+                        path.extend(comodel.cloned());
+                        (path, name)
+                    }
+                };
+                found.push(ArchField {
+                    name: FieldName::new(name),
+                    within,
+                    locator: false,
+                    attribute: Some(attribute.to_string()),
+                    location: location.clone(),
+                });
+            }
+        };
+        let written: Vec<(&str, &str)> = if node.has_tag_name("attribute") {
+            match (node.attribute("name"), node.text()) {
+                (Some(name), Some(text)) => vec![(name, text)],
+                _ => Vec::new(),
+            }
+        } else {
+            node.attributes()
+                .map(|attribute| (attribute.name(), attribute.value()))
+                .collect()
+        };
+        let field = node
+            .has_tag_name("field")
+            .then(|| node.attribute("name").map(FieldName::new))
+            .flatten();
+        for (attribute, expression) in written {
+            match attribute {
+                "invisible" | "readonly" | "required" | "column_invisible" | "context" => {
+                    push(expression_names(expression), None, attribute);
+                }
+                "domain" | "filter_domain" => {
+                    let (fields, mut names) = domain_names(expression);
+                    // A search field's domain gets the searched value.
+                    if attribute == "filter_domain" {
+                        names.retain(|name| name != "raw_value");
+                    }
+                    // A field's domain filters its comodel; any other
+                    // element's, the view's model.
+                    let comodel = (attribute == "domain" && !node.has_tag_name("attribute"))
+                        .then_some(field.as_ref())
+                        .flatten();
+                    if comodel.is_some() || !node.has_tag_name("attribute") {
+                        push(fields, comodel, attribute);
+                    }
+                    push(names, None, attribute);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Every reference by external id in the file, wherever it is.
@@ -463,6 +553,160 @@ fn eval_refs(expr: &str) -> Vec<&str> {
     }
     found
 }
+
+/// Names an expression gives Odoo's view validation to check, as its
+/// `get_expression_field_names` does: the first name of each dotted
+/// name, or the whole `parent.x`, leaving out what the evaluation context
+/// provides (`context`, `uid`, `today`, ...).
+fn expression_names(expression: &str) -> Vec<String> {
+    let Ok(parsed) = parse_expression(expression.trim()) else {
+        return Vec::new();
+    };
+    let mut dotted = Vec::new();
+    contextual_values(&parsed.syntax().body, &mut dotted);
+    field_names(dotted)
+}
+
+/// The names of dotted names Odoo checks: the first name, or `parent.x`.
+fn field_names(dotted: Vec<String>) -> Vec<String> {
+    let mut names = Vec::new();
+    for name in dotted {
+        if name == "parent" {
+            continue;
+        }
+        let root = name.split('.').next().unwrap_or_default();
+        let kept = if root == "parent" {
+            // `parent.x.y` checks `x` on the parent.
+            name.splitn(3, '.').take(2).collect::<Vec<_>>().join(".")
+        } else {
+            root.to_string()
+        };
+        if !IGNORED_IN_EXPRESSION.contains(&root) && !names.contains(&kept) {
+            names.push(kept);
+        }
+    }
+    names
+}
+
+/// The fields a domain filters on (the first element of each leaf, when a
+/// string) and the names its values use.
+fn domain_names(domain: &str) -> (Vec<String>, Vec<String>) {
+    let Ok(parsed) = parse_expression(domain.trim()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Expr::List(list) = &*parsed.syntax().body else {
+        return (Vec::new(), expression_names(domain));
+    };
+    let mut fields = Vec::new();
+    let mut values = Vec::new();
+    for leaf in &list.elts {
+        match leaf {
+            Expr::Tuple(tuple) if tuple.elts.len() == 3 => {
+                if let Expr::StringLiteral(field) = &tuple.elts[0] {
+                    let field = field.value.to_str().to_string();
+                    if !fields.contains(&field) {
+                        fields.push(field);
+                    }
+                }
+                contextual_values(&tuple.elts[2], &mut values);
+            }
+            Expr::StringLiteral(_) | Expr::BooleanLiteral(_) => {}
+            other => contextual_values(other, &mut values),
+        }
+    }
+    (fields, field_names(values))
+}
+
+/// Every dotted name an expression reads, as Odoo's
+/// `_get_expression_contextual_values` collects them.
+fn contextual_values(expr: &Expr, found: &mut Vec<String>) {
+    match expr {
+        Expr::Name(name) => found.push(name.id.as_str().to_string()),
+        Expr::Attribute(attribute) => {
+            let mut inner = Vec::new();
+            contextual_values(&attribute.value, &mut inner);
+            match inner.as_slice() {
+                [one] => found.push(format!("{one}.{}", attribute.attr.as_str())),
+                _ => found.extend(inner),
+            }
+        }
+        Expr::List(list) => list
+            .elts
+            .iter()
+            .for_each(|item| contextual_values(item, found)),
+        Expr::Tuple(tuple) => tuple
+            .elts
+            .iter()
+            .for_each(|item| contextual_values(item, found)),
+        Expr::Subscript(subscript) => {
+            contextual_values(&subscript.value, found);
+            contextual_values(&subscript.slice, found);
+        }
+        Expr::Compare(compare) => {
+            compare
+                .operands
+                .iter()
+                .for_each(|item| contextual_values(item, found));
+        }
+        Expr::BinOp(binary) => {
+            contextual_values(&binary.left, found);
+            contextual_values(&binary.right, found);
+        }
+        Expr::BoolOp(boolean) => boolean
+            .values
+            .iter()
+            .for_each(|item| contextual_values(item, found)),
+        Expr::UnaryOp(unary) => contextual_values(&unary.operand, found),
+        Expr::Call(call) => {
+            contextual_values(&call.func, found);
+            call.arguments
+                .args
+                .iter()
+                .for_each(|item| contextual_values(item, found));
+        }
+        Expr::If(conditional) => {
+            contextual_values(&conditional.test, found);
+            contextual_values(&conditional.body, found);
+            contextual_values(&conditional.orelse, found);
+        }
+        Expr::Dict(dict) => {
+            for item in &dict.items {
+                if let Some(key) = &item.key {
+                    contextual_values(key, found);
+                }
+                contextual_values(&item.value, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Names the evaluation context of a view expression provides, from Odoo's
+/// `IGNORED_IN_EXPRESSION` (the same in 18.0 and 19.0).
+const IGNORED_IN_EXPRESSION: [&str; 22] = [
+    "True",
+    "False",
+    "None",
+    "self",
+    "uid",
+    "context",
+    "context_today",
+    "allowed_company_ids",
+    "current_company_id",
+    "time",
+    "datetime",
+    "relativedelta",
+    "current_date",
+    "today",
+    "now",
+    "abs",
+    "len",
+    "bool",
+    "float",
+    "str",
+    "unicode",
+    "set",
+];
 
 /// The literal `'xml_id'` values of the dictionaries in an `eval` list,
 /// as `_update_xmlids` takes them. Anything else, or Python that does not
@@ -812,5 +1056,69 @@ mod tests {
                 ("stock.picking_type_in", 3)
             ]
         );
+    }
+
+    #[test]
+    fn view_expressions_name_the_fields_odoo_checks() {
+        let file = parse(&[
+            "<odoo><record id='v' model='ir.ui.view'><field name='arch' type='xml'>",
+            "<form>",
+            "  <field name='partner_id' invisible=\"not state or context.get('x') or uid\"",
+            "         domain=\"[('country_id.code', '=', company_id.country_code), '|', ('active', '=', True)]\"/>",
+            "  <field name='line_ids' readonly=\"locked\">",
+            "    <list><field name='qty' column_invisible=\"parent.hide_qty\" required=\"parent and product_id\"/></list>",
+            "  </field>",
+            "  <button name='go' invisible='today &gt; date_deadline' context=\"{'default_user_id': user_id}\"/>",
+            "  <div invisible='not ( broken'/>",
+            "</form>",
+            "</field></record>",
+            "<record id='s' model='ir.ui.view'><field name='arch' type='xml'>",
+            "<search><field name='name' filter_domain=\"[('ref', 'ilike', raw_value)]\"/></search>",
+            "</field></record>",
+            "<record id='i' model='ir.ui.view'><field name='arch' type='xml'>",
+            "<field name='date' position='attributes'><attribute name='invisible'>not posted</attribute></field>",
+            "</field></record></odoo>",
+        ]);
+        let expressions = |index: usize| -> Vec<(String, Vec<String>, String)> {
+            file.data.records[index]
+                .view
+                .as_ref()
+                .expect("a view")
+                .fields
+                .iter()
+                .filter_map(|field| {
+                    let attribute = field.attribute.clone()?;
+                    let within = field
+                        .within
+                        .iter()
+                        .map(|name| name.as_str().to_string())
+                        .collect();
+                    Some((field.name.as_str().to_string(), within, attribute))
+                })
+                .collect()
+        };
+        let named = |name: &str, within: &[&str], attribute: &str| {
+            (
+                name.to_string(),
+                within.iter().map(|name| name.to_string()).collect(),
+                attribute.to_string(),
+            )
+        };
+        assert_eq!(
+            expressions(0),
+            [
+                named("state", &[], "invisible"),
+                named("country_id.code", &["partner_id"], "domain"),
+                named("active", &["partner_id"], "domain"),
+                named("company_id", &[], "domain"),
+                named("locked", &[], "readonly"),
+                named("hide_qty", &[], "column_invisible"),
+                named("product_id", &["line_ids"], "required"),
+                named("date_deadline", &[], "invisible"),
+                named("user_id", &[], "context"),
+            ]
+        );
+        assert_eq!(expressions(1), [named("ref", &[], "filter_domain")]);
+        assert_eq!(expressions(2), [named("posted", &[], "invisible")]);
     }
 }
