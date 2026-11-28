@@ -215,13 +215,16 @@ pub enum Problem {
         /// How the module refers to it.
         how: RefKind,
     },
-    /// An inheriting view's XPath finds nothing in the architecture of the
+    /// An inheriting view's XPath, or its locator (`<field name="...">`,
+    /// `<button name="...">`), finds nothing in the architecture of the
     /// view it inherits, as the target version makes it.
     ViewTargetGone {
         /// The inherited view, as `module.xmlid`.
         view: String,
-        /// The XPath, as written.
+        /// The XPath, or the locator without its `position`.
         spec: String,
+        /// Whether it is an `<xpath>`.
+        xpath: bool,
     },
     /// A test uses a record only demo data creates, and the target makes
     /// databases without demo data unless told otherwise.

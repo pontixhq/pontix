@@ -1273,7 +1273,7 @@ fn tests_that_need_gone_or_demo_records_are_warnings() {
 }
 
 #[test]
-fn xpaths_that_find_nothing_in_the_target_view_are_errors() {
+fn xpaths_and_locators_that_find_nothing_in_the_target_view_are_errors() {
     use pontix_core::PtxCode;
 
     let xml = |file: &str, body: &str| {
@@ -1289,15 +1289,30 @@ fn xpaths_that_find_nothing_in_the_target_view_are_errors() {
     let (mut source, mut target) = (source(), target());
     source.modules[1].data = vec![xml(
         "sale/views.xml",
-        &form("<field name='partner_id'/><field name='date_order'/>"),
+        &form(
+            "<field name='partner_id'/><field name='date_order'/><field name='note'/><button name='action_confirm'/>",
+        ),
     )];
     target.modules[1].data = vec![xml("sale/views.xml", &form("<field name='partner_id'/>"))];
+    // Views are records of `ir.ui.view`, which base defines.
+    for addons in [&mut source, &mut target] {
+        addons.modules[0].models.push(model(
+            "base/models.py",
+            "ir.ui.view",
+            Inherit::Absent,
+            vec![],
+            vec![],
+        ));
+    }
     let mine = xml(
         "custom_sale/views.xml",
         "<record id='view_order_form' model='ir.ui.view'><field name='inherit_id' ref='sale.view_order_form'/><field name='arch' type='xml'>\
          <xpath expr=\"//field[@name='date_order']\" position='after'><field name='x'/></xpath>\
          <xpath expr=\"//field[@name='partner_id']\" position='after'><field name='y'/></xpath>\
          <xpath expr=\"//field[@name='y']\" position='after'/>\
+         <button name='action_confirm' position='attributes'><attribute name='string'>Go</attribute></button>\
+         <field name='partner_id' position='after'/>\
+         <field name='note' position='after'/>\
          <xpath expr=\"//label[text()='Customer']\" position='after'/>\
          <xpath expr=\"//field[@name='never_there']\" position='after'/>\
          </field></record>",
@@ -1317,18 +1332,34 @@ fn xpaths_that_find_nothing_in_the_target_view_are_errors() {
         .filter(|issue| matches!(issue.problem, Problem::ViewTargetGone { .. }))
         .map(|issue| (issue.at.line.get(), &issue.problem))
         .collect();
-    // Only `date_order`: `y` comes from the view itself, `text()` is not
-    // read, and `never_there` never matched.
+    // `y` comes from the view itself, `note` is reported as a
+    // field gone from the model, `text()` is not read, and what follows it
+    // is not looked at.
     assert_eq!(
         gone,
-        [(
-            1,
-            &Problem::ViewTargetGone {
-                view: "sale.view_order_form".to_string(),
-                spec: "//field[@name='date_order']".to_string(),
-            }
-        )]
+        [
+            (
+                1,
+                &Problem::ViewTargetGone {
+                    view: "sale.view_order_form".to_string(),
+                    spec: "//field[@name='date_order']".to_string(),
+                    xpath: true,
+                }
+            ),
+            (
+                1,
+                &Problem::ViewTargetGone {
+                    view: "sale.view_order_form".to_string(),
+                    spec: "<button name=\"action_confirm\">".to_string(),
+                    xpath: false,
+                }
+            ),
+        ]
     );
+    assert!(scan.issues.iter().any(|issue| matches!(
+        &issue.problem,
+        Problem::FieldGone { field, how: PathUse::View(_), .. } if field.as_str() == "note"
+    )));
     let finding = report(&scan)
         .findings
         .into_iter()

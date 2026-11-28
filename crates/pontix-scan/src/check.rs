@@ -6,8 +6,8 @@ use std::num::NonZeroU32;
 
 use pontix_core::resolve::{model_kind, model_name};
 use pontix_core::{
-    ApiDecorator, ChangeSet, DiagnosticKind, FieldDef, FieldName, Location, MethodDef, ModelDef,
-    ModelKind, ModelName, ModuleName, RefKind, Rename, View, Written, XmlRef,
+    ApiDecorator, ChangeSet, DiagnosticKind, Element, FieldDef, FieldName, Location, MethodDef,
+    ModelDef, ModelKind, ModelName, ModuleName, Record, RefKind, Rename, View, Written, XmlRef,
 };
 use pontix_index::registry::{self, MethodView, ModelView, Xmlid, qualified};
 use pontix_index::views::{self, Located, Views};
@@ -340,31 +340,13 @@ impl Checker<'_, '_, '_, '_> {
                     .as_deref()
                     .map(|id| qualified(&module.name, id))
                     .unwrap_or_default();
+                if self.versions.target.defines(&record.model, self.scope.1) {
+                    self.record_fields(module, record, &id);
+                }
+                // After its fields, so that a locator whose field is gone is
+                // reported once, as that field.
                 if let Some(view) = &record.view {
                     self.view_targets(&id, view);
-                }
-                if !self.versions.target.defines(&record.model, self.scope.1) {
-                    continue;
-                }
-                for (field, at) in &record.fields {
-                    let how = PathUse::RecordValue(id.clone());
-                    self.path(&record.model, field.as_str(), how, at);
-                }
-                let Some(view) = &record.view else {
-                    continue;
-                };
-                let Some(model) = self.view_model(&module.name, view) else {
-                    continue;
-                };
-                for field in &view.fields {
-                    let path: Vec<&str> = field
-                        .within
-                        .iter()
-                        .chain(std::iter::once(&field.name))
-                        .map(FieldName::as_str)
-                        .collect();
-                    let how = PathUse::View(id.clone());
-                    self.path(&model, &path.join("."), how, &field.location);
                 }
             }
             for reference in &file.refs {
@@ -376,9 +358,34 @@ impl Checker<'_, '_, '_, '_> {
         }
     }
 
-    /// The XPath specs of an inheriting view that find something in the
-    /// source version of the view it inherits and nothing in the target
-    /// one. Each spec looks at the architecture the ones before it made, in
+    /// The fields a record sets and, for a view, those its architecture
+    /// shows or locates.
+    fn record_fields(&mut self, module: &Module, record: &Record, id: &str) {
+        for (field, at) in &record.fields {
+            let how = PathUse::RecordValue(id.to_string());
+            self.path(&record.model, field.as_str(), how, at);
+        }
+        let Some(view) = &record.view else {
+            return;
+        };
+        let Some(model) = self.view_model(&module.name, view) else {
+            return;
+        };
+        for field in &view.fields {
+            let path: Vec<&str> = field
+                .within
+                .iter()
+                .chain(std::iter::once(&field.name))
+                .map(FieldName::as_str)
+                .collect();
+            let how = PathUse::View(id.to_string());
+            self.path(&model, &path.join("."), how, &field.location);
+        }
+    }
+
+    /// The specs of an inheriting view, XPath or locator, that find
+    /// something in the source version of the view it inherits and nothing
+    /// in the target one. Each spec looks at the architecture the ones before it made, in
     /// the target version as far as they still apply. Whatever Pontix
     /// cannot combine or read with certainty is left out.
     fn view_targets(&mut self, id: &str, view: &View) {
@@ -405,12 +412,30 @@ impl Checker<'_, '_, '_, '_> {
                 return;
             };
             let worked = before.at(&found).map(|element| element.location.clone());
-            if spec.tag == "xpath" && views::locate(&after, spec) == Located::Missing {
+            // A `<field>` locator whose field is gone from the model is
+            // reported once, as that field.
+            let reported = spec.tag == "field"
+                && self.issues.iter().any(|issue| {
+                    issue.module == *self.module
+                        && issue.at == spec.location
+                        && matches!(
+                            &issue.problem,
+                            Problem::FieldGone { path, .. }
+                                if Some(path.as_str()) == spec.attribute("name")
+                        )
+                });
+            if !reported && views::locate(&after, spec) == Located::Missing {
+                let xpath = spec.tag == "xpath";
                 self.push(
                     &spec.location,
                     Problem::ViewTargetGone {
                         view: parent.clone(),
-                        spec: spec.attribute("expr").unwrap_or_default().to_string(),
+                        spec: if xpath {
+                            spec.attribute("expr").unwrap_or_default().to_string()
+                        } else {
+                            locator(spec)
+                        },
+                        xpath,
                     },
                     Since::Upgrade,
                     Evidence {
@@ -777,6 +802,18 @@ impl Checker<'_, '_, '_, '_> {
             evidence,
         });
     }
+}
+
+/// A locator spec as written, without its `position`: `<button
+/// name="action_confirm">`.
+fn locator(spec: &Element) -> String {
+    let attributes: String = spec
+        .attributes
+        .iter()
+        .filter(|(name, _)| name != "position")
+        .map(|(name, value)| format!(" {name}=\"{value}\""))
+        .collect();
+    format!("<{}{attributes}>", spec.tag)
 }
 
 fn since(worked_before: bool) -> Since {
