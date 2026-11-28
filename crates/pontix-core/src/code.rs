@@ -5,6 +5,9 @@
 //! from the code itself: `self` in a model's method, `env["model"]` with a
 //! literal name, or `env.ref("module.xmlid")`, and fields reached from them.
 //! Everything else is left out, never guessed.
+//!
+//! Framework names are kept the same way: only through an import of an
+//! `odoo` module that the file itself makes.
 
 use crate::symbol::{Location, ModelName};
 
@@ -17,6 +20,9 @@ pub enum CodeRoot {
     Model(ModelName),
     /// `env.ref("module.xmlid")`: the record with that external id.
     Xmlid(String),
+    /// A name of the Odoo framework, written in full, such as
+    /// `odoo.tools.ormcache_context`. Its path is always empty.
+    Framework(String),
 }
 
 /// How the code uses the last field of a reference.
@@ -32,6 +38,11 @@ pub enum CodeUse {
     Domain,
     /// A field path passed as a string, as in `mapped("line_ids.price")`.
     FieldString,
+    /// Calls the last name of the path as a method of the records, as in
+    /// `self.read_group(...)`.
+    Call,
+    /// Imports a framework name: `from odoo.tools import ormcache_context`.
+    Import,
 }
 
 /// A chain of fields Python code goes through, from a root whose model is

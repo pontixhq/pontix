@@ -83,11 +83,117 @@ pub(super) enum Ty {
     /// `self` or `cls` of a class that is not a model, such as a test case:
     /// its attributes are the ones its methods assign.
     Plain,
+    /// A name of the Odoo framework, in full: an `odoo` module imported by
+    /// the file, or something reached from one.
+    Framework(String),
+}
+
+/// Names a file binds to the Odoo framework by importing it, with what
+/// each stands for in full: `from odoo import tools` binds `tools` to
+/// `odoo.tools`.
+pub(super) type Aliases = HashMap<String, String>;
+
+/// The framework names a file imports, anywhere in it, and the imports
+/// themselves as references. Imports of addons are modules, not framework.
+pub(super) fn aliases(source: &SourceFile<'_>, body: &[Stmt]) -> (Aliases, Vec<CodeRef>) {
+    let mut aliases = Aliases::new();
+    let mut refs = Vec::new();
+    collect_imports(source, body, &mut aliases, &mut refs);
+    (aliases, refs)
+}
+
+fn framework_module(module: &str) -> bool {
+    (module == "odoo" || module.starts_with("odoo."))
+        && module != "odoo.addons"
+        && !module.starts_with("odoo.addons.")
+}
+
+fn import_ref(source: &SourceFile<'_>, name: String, at: TextSize) -> CodeRef {
+    CodeRef {
+        root: CodeRoot::Framework(name),
+        path: Vec::new(),
+        how: CodeUse::Import,
+        location: source.location(at),
+    }
+}
+
+fn collect_imports(
+    source: &SourceFile<'_>,
+    body: &[Stmt],
+    aliases: &mut Aliases,
+    refs: &mut Vec<CodeRef>,
+) {
+    for stmt in body {
+        match stmt {
+            Stmt::Import(import) => {
+                for alias in &import.names {
+                    let module = alias.name.as_str();
+                    if !framework_module(module) {
+                        continue;
+                    }
+                    match &alias.asname {
+                        Some(asname) => {
+                            aliases.insert(asname.as_str().to_string(), module.to_string());
+                        }
+                        None => {
+                            aliases.insert("odoo".to_string(), "odoo".to_string());
+                        }
+                    }
+                    if module != "odoo" {
+                        refs.push(import_ref(source, module.to_string(), stmt.start()));
+                    }
+                }
+            }
+            Stmt::ImportFrom(import) if import.level == 0 => {
+                let Some(module) = import.module.as_ref().map(|m| m.as_str()) else {
+                    continue;
+                };
+                if !framework_module(module) {
+                    continue;
+                }
+                for alias in &import.names {
+                    let name = alias.name.as_str();
+                    if name == "*" {
+                        continue;
+                    }
+                    let full = format!("{module}.{name}");
+                    let bound = alias.asname.as_ref().map_or(name, |asname| asname.as_str());
+                    aliases.insert(bound.to_string(), full.clone());
+                    refs.push(import_ref(source, full, stmt.start()));
+                }
+            }
+            Stmt::FunctionDef(def) => collect_imports(source, &def.body, aliases, refs),
+            Stmt::ClassDef(class) => collect_imports(source, &class.body, aliases, refs),
+            Stmt::If(if_stmt) => {
+                collect_imports(source, &if_stmt.body, aliases, refs);
+                for clause in &if_stmt.elif_else_clauses {
+                    collect_imports(source, &clause.body, aliases, refs);
+                }
+            }
+            Stmt::Try(try_stmt) => {
+                collect_imports(source, &try_stmt.body, aliases, refs);
+                for handler in &try_stmt.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_imports(source, &handler.body, aliases, refs);
+                }
+                collect_imports(source, &try_stmt.orelse, aliases, refs);
+                collect_imports(source, &try_stmt.finalbody, aliases, refs);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Attributes that the methods of a non-model class assign on `self` or
 /// `cls`. `None` marks one assigned values of different types.
 pub(super) type Attributes = HashMap<String, Option<Ty>>;
+
+/// The kind of function being read, and the file's framework imports.
+#[derive(Clone, Copy)]
+pub(super) struct Context<'a> {
+    pub(super) owner: Owner<'a>,
+    pub(super) aliases: &'a Aliases,
+}
 
 /// The kind of function being read.
 #[derive(Clone, Copy)]
@@ -100,14 +206,18 @@ pub(super) enum Owner<'a> {
     Function,
 }
 
-/// The references `def` makes, in source order of their expressions.
+/// The references `def` makes, its decorators included, in source order of
+/// their expressions.
 pub(super) fn refs(
     source: &SourceFile<'_>,
     def: &StmtFunctionDef,
-    owner: Owner<'_>,
+    context: Context<'_>,
 ) -> Vec<CodeRef> {
-    let mut code = Code::new(source, def, owner);
+    let mut code = Code::new(source, def, context);
     code.bind_body(&def.body);
+    for decorator in &def.decorator_list {
+        code.expr(&decorator.expression, false);
+    }
     code.visit_body(&def.body);
     code.out.sort_by_key(|(at, _)| *at);
     code.out.into_iter().map(|(_, found)| found).collect()
@@ -116,14 +226,22 @@ pub(super) fn refs(
 /// The attributes the methods of a non-model class assign on their receiver,
 /// typed in source order, so `setUpClass` can build on attributes it
 /// assigned before.
-pub(super) fn attributes(source: &SourceFile<'_>, class: &StmtClassDef) -> Attributes {
+pub(super) fn attributes(
+    source: &SourceFile<'_>,
+    class: &StmtClassDef,
+    aliases: &Aliases,
+) -> Attributes {
     let mut attributes = Attributes::new();
     for stmt in &class.body {
         let Stmt::FunctionDef(def) = stmt else {
             continue;
         };
         let assigned = {
-            let mut code = Code::new(source, def, Owner::Plain(&attributes));
+            let context = Context {
+                owner: Owner::Plain(&attributes),
+                aliases,
+            };
+            let mut code = Code::new(source, def, context);
             code.bind_body(&def.body);
             let mut assigned = Vec::new();
             code.receiver_assignments(&def.body, &mut assigned);
@@ -153,6 +271,7 @@ fn merge(types: &mut HashMap<String, Option<Ty>>, name: String, ty: Option<Ty>) 
 struct Code<'a, 's> {
     source: &'a SourceFile<'s>,
     owner: Owner<'a>,
+    aliases: &'a Aliases,
     /// Name of `self` or `cls`, when the function has a receiver.
     receiver: Option<String>,
     /// Local variables, flow-insensitive.
@@ -164,7 +283,8 @@ struct Code<'a, 's> {
 }
 
 impl<'a, 's> Code<'a, 's> {
-    fn new(source: &'a SourceFile<'s>, def: &StmtFunctionDef, owner: Owner<'a>) -> Self {
+    fn new(source: &'a SourceFile<'s>, def: &StmtFunctionDef, context: Context<'a>) -> Self {
+        let owner = context.owner;
         let receiver = match owner {
             Owner::Function => None,
             Owner::Model | Owner::Plain(_) if is_staticmethod(def) => None,
@@ -179,6 +299,7 @@ impl<'a, 's> Code<'a, 's> {
         Self {
             source,
             owner,
+            aliases: context.aliases,
             receiver,
             vars: HashMap::new(),
             scopes: Vec::new(),
@@ -312,7 +433,7 @@ impl<'a, 's> Code<'a, 's> {
                     Expr::NumberLiteral(_) | Expr::Slice(_) | Expr::UnaryOp(_)
                 )
                 .then_some(records),
-                Ty::Plain => None,
+                Ty::Plain | Ty::Framework(_) => None,
             },
             Expr::Call(call) => self.call(call),
             Expr::BinOp(binop) if binop.op == Operator::BitOr => {
@@ -341,6 +462,9 @@ impl<'a, 's> Code<'a, 's> {
                 Owner::Plain(_) => Some(Ty::Plain),
                 Owner::Function => None,
             };
+        }
+        if let Some(full) = self.aliases.get(name) {
+            return Some(Ty::Framework(full.clone()));
         }
         (name == "env").then_some(Ty::Env)
     }
@@ -374,6 +498,7 @@ impl<'a, 's> Code<'a, 's> {
                     Owner::Model | Owner::Function => None,
                 }
             }
+            Ty::Framework(full) => Some(Ty::Framework(format!("{full}.{attr}"))),
         }
     }
 
@@ -405,7 +530,7 @@ impl<'a, 's> Code<'a, 's> {
                 }
                 None
             }
-            Ty::Env | Ty::Plain => None,
+            Ty::Env | Ty::Plain | Ty::Framework(_) => None,
         }
     }
 
@@ -428,13 +553,19 @@ impl<'a, 's> Code<'a, 's> {
         match expr {
             Expr::Attribute(attribute) => {
                 let ty = self.attribute(attribute);
-                if !chained
-                    && let Some(Ty::Records(root, path)) = &ty
-                    && !path.is_empty()
-                {
-                    self.emit(root.clone(), path.clone(), CodeUse::Attribute, expr.start());
+                if !chained {
+                    match &ty {
+                        Some(Ty::Records(root, path)) if !path.is_empty() => {
+                            self.emit(root.clone(), path.clone(), CodeUse::Attribute, expr.start());
+                        }
+                        Some(Ty::Framework(full)) => {
+                            let root = CodeRoot::Framework(full.clone());
+                            self.emit(root, Vec::new(), CodeUse::Attribute, expr.start());
+                        }
+                        _ => {}
+                    }
                 }
-                let continues = matches!(ty, Some(Ty::Records(..)));
+                let continues = matches!(ty, Some(Ty::Records(..) | Ty::Framework(_)));
                 self.expr(&attribute.value, continues);
             }
             Expr::Subscript(subscript) => {
@@ -472,7 +603,19 @@ impl<'a, 's> Code<'a, 's> {
         let method = func.attr.as_str();
         let receiver = self.ty(&func.value);
         let mut handled: Vec<&Expr> = Vec::new();
+        if let Some(Ty::Framework(full)) = &receiver
+            && !chained
+        {
+            let root = CodeRoot::Framework(format!("{full}.{method}"));
+            self.emit(root, Vec::new(), CodeUse::Attribute, func.start());
+        }
         if let Some(Ty::Records(root, path)) = &receiver {
+            // `records.env(...)` calls the environment, not a method.
+            if !NOT_FIELDS.contains(&method) {
+                let mut called = path.clone();
+                called.push(method.to_string());
+                self.emit(root.clone(), called, CodeUse::Call, func.attr.start());
+            }
             let arguments = &call.arguments;
             if WRITE_VALUES.contains(&method) {
                 let values = arguments
@@ -516,8 +659,11 @@ impl<'a, 's> Code<'a, 's> {
                 }
             }
         }
-        let keeps = matches!(receiver, Some(Ty::Records(..)))
-            && (SAME_RECORDS.contains(&method) || method == "mapped");
+        let keeps = match receiver {
+            Some(Ty::Records(..)) => SAME_RECORDS.contains(&method) || method == "mapped",
+            Some(Ty::Framework(_)) => true,
+            _ => false,
+        };
         self.expr(&func.value, chained && keeps);
         for argument in &call.arguments.args {
             if !handled.iter().any(|done| std::ptr::eq(*done, argument)) {
@@ -746,20 +892,34 @@ mod tests {
 
     use crate::python::parse_python;
 
-    /// Each reference as `root:path how line`, for easy comparison.
+    /// Each field or model reference as `root:path how line`, for easy
+    /// comparison: method calls and framework names are left to
+    /// [`show_all`].
     fn show(refs: &[CodeRef]) -> Vec<String> {
+        let fields: Vec<CodeRef> = refs
+            .iter()
+            .filter(|r| r.how != CodeUse::Call && !matches!(r.root, CodeRoot::Framework(_)))
+            .cloned()
+            .collect();
+        show_all(&fields)
+    }
+
+    fn show_all(refs: &[CodeRef]) -> Vec<String> {
         refs.iter()
             .map(|r| {
                 let root = match &r.root {
                     CodeRoot::Own => "self".to_string(),
                     CodeRoot::Model(model) => model.to_string(),
                     CodeRoot::Xmlid(xmlid) => format!("ref({xmlid})"),
+                    CodeRoot::Framework(name) => name.clone(),
                 };
                 let how = match r.how {
                     CodeUse::Attribute => "attr",
                     CodeUse::Values => "vals",
                     CodeUse::Domain => "domain",
                     CodeUse::FieldString => "string",
+                    CodeUse::Call => "call",
+                    CodeUse::Import => "import",
                 };
                 format!("{root}:{} {how} {}", r.path.join("."), r.location.line)
             })
@@ -909,6 +1069,48 @@ mod tests {
                 "res.partner: attr 2",
                 "res.partner:ref domain 2",
                 "res.partner:ref vals 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn framework_names_and_record_calls() {
+        let file = parse_python(
+            Path::new("models/x.py"),
+            &[
+                "from odoo import api, models, tools",
+                "from odoo.osv import expression",
+                "from odoo.addons.sale.models import sale_order",
+                "class Order(models.Model):",
+                "    _inherit = 'sale.order'",
+                "    @tools.ormcache_context('self.env.uid', keys=('lang',))",
+                "    def run(self):",
+                "        domain = expression.AND([[], []])",
+                "        return self.read_group(domain, [], [])",
+                "def hook(env):",
+                "    import odoo.tools.misc as misc",
+                "    env['res.partner']._where_calc([])",
+                "    misc.format_date(env, False)",
+                "    sale_order.anything",
+            ]
+            .join("\n"),
+        );
+        let mut refs = file.code_refs.clone();
+        refs.extend(file.models[0].methods[0].code_refs.clone());
+        assert_eq!(
+            show_all(&refs),
+            [
+                "odoo.api: import 1",
+                "odoo.models: import 1",
+                "odoo.tools: import 1",
+                "odoo.osv.expression: import 2",
+                "odoo.tools.misc: import 11",
+                "res.partner: attr 12",
+                "res.partner:_where_calc call 12",
+                "odoo.tools.misc.format_date: attr 13",
+                "odoo.tools.ormcache_context: attr 6",
+                "odoo.osv.expression.AND: attr 8",
+                "self:read_group call 9",
             ]
         );
     }

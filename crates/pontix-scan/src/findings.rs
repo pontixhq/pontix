@@ -8,7 +8,7 @@ use pontix_core::{
     Suggestion,
 };
 
-use crate::{Issue, ModelUse, PathUse, Problem, Scan, Since};
+use crate::{ApiUse, Issue, ModelUse, PathUse, Problem, Scan, Since};
 
 /// What Pontix does not check yet. A report always lists them, so that no
 /// finding never reads as safe.
@@ -18,9 +18,8 @@ pub const NOT_COVERED: &[&str] = &[
     "view_expressions",
     "qweb",
     // Python code whose model Pontix cannot tell, such as a method
-    // parameter, and the framework API it calls.
+    // parameter.
     "untyped_python",
-    "core_python_api",
     "csv",
 ];
 
@@ -134,6 +133,22 @@ fn classify(issue: &Issue, target: &str) -> Classified {
             issue.module.to_string(),
             format!(
                 "migrations/{version} is for a version below {target}: its scripts never run again."
+            ),
+        ),
+        Problem::ApiGone { api, how } => Classified {
+            severity: matches!(how, ApiUse::Test(_)).then_some(Severity::Warning),
+            ..plain(
+                PtxCode::A101,
+                api.clone(),
+                format!("{api} does not exist in {target} ({}).", api_use(how)),
+            )
+        },
+        Problem::ApiDeprecated { api, how } => plain(
+            PtxCode::A102,
+            api.clone(),
+            format!(
+                "{api} is deprecated in {target} ({}): it still works, but core warns that it will go.",
+                api_use(how)
             ),
         ),
         Problem::ModelNameChanges { class, from, to } => plain(
@@ -377,12 +392,23 @@ fn path_use(how: &PathUse) -> String {
     }
 }
 
+fn api_use(how: &ApiUse) -> String {
+    match how {
+        ApiUse::Import => "imported".to_string(),
+        ApiUse::Attribute => "used through an imported module".to_string(),
+        ApiUse::Call(model) => format!("called on {model} records"),
+        ApiUse::Test(inner) => format!("{} in tests", api_use(inner)),
+    }
+}
+
 fn code_use(how: CodeUse) -> &'static str {
     match how {
         CodeUse::Attribute => "attribute",
         CodeUse::Values => "values written",
         CodeUse::Domain => "domain",
         CodeUse::FieldString => "field name in a string",
+        CodeUse::Call => "method call",
+        CodeUse::Import => "import",
     }
 }
 

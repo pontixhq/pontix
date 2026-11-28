@@ -6,13 +6,13 @@
 //! in the version upgraded from. Anything else may be a Python attribute
 //! Pontix cannot see, and is left alone.
 
-use pontix_core::{CodeRef, CodeRoot, Location, ModelName};
-use pontix_index::Module;
+use pontix_core::{CodeRef, CodeRoot, CodeUse, Location, ModelName};
 use pontix_index::registry::qualified;
+use pontix_index::{Lookup, Module};
 
-use super::Checker;
-use crate::path::{Walk, lookup, walk};
-use crate::{Evidence, ModelUse, PathUse, Problem, Since};
+use super::{Checker, find_method};
+use crate::path::{Walk, lookup, reach, walk};
+use crate::{ApiUse, Evidence, ModelUse, PathUse, Problem, Since};
 
 impl Checker<'_, '_, '_, '_> {
     /// What the module's functions, non-model classes and tests use.
@@ -28,7 +28,21 @@ impl Checker<'_, '_, '_, '_> {
     /// One reference. `own` is the model whose method it is in, for
     /// references that start at `self`.
     pub(super) fn code_ref(&mut self, own: Option<&ModelName>, found: &CodeRef, in_tests: bool) {
+        let tested = |how: ApiUse| {
+            if in_tests {
+                ApiUse::Test(Box::new(how))
+            } else {
+                how
+            }
+        };
         let start = match &found.root {
+            CodeRoot::Framework(name) => {
+                let how = match found.how {
+                    CodeUse::Import => ApiUse::Import,
+                    _ => ApiUse::Attribute,
+                };
+                return self.framework_name(name, tested(how), &found.location);
+            }
             CodeRoot::Own => match own {
                 Some(model) => model.clone(),
                 None => return,
@@ -50,12 +64,131 @@ impl Checker<'_, '_, '_, '_> {
                 }
             }
         };
+        if found.how == CodeUse::Call {
+            let Some((method, path)) = found.path.split_last() else {
+                return;
+            };
+            let Some(model) = reach(&self.versions.source.models, &start, path) else {
+                return;
+            };
+            let how = tested(ApiUse::Call(model.clone()));
+            return self.method_call(&model, method, how, &found.location);
+        }
         let how = if in_tests {
             PathUse::Test(found.how)
         } else {
             PathUse::Code(found.how)
         };
         self.code_path(&start, &found.path, how, &found.location);
+    }
+
+    /// A framework name, such as `odoo.osv.expression.AND`: each part is
+    /// looked up in turn, and only one that existed before is reported.
+    fn framework_name(&mut self, name: &str, how: ApiUse, at: &Location) {
+        let (source, target) = (
+            self.versions.source.framework,
+            self.versions.target.framework,
+        );
+        if source.is_empty() || target.is_empty() {
+            return;
+        }
+        let parts: Vec<&str> = name.split('.').collect();
+        for end in 2..=parts.len() {
+            let prefix = parts[..end].join(".");
+            let Lookup::Found(before) = source.lookup(&prefix) else {
+                return;
+            };
+            let problem = match target.lookup(&prefix) {
+                Lookup::Missing => Problem::ApiGone { api: prefix, how },
+                Lookup::Found(after)
+                    if after.deprecated.is_some() && before.deprecated.is_none() =>
+                {
+                    let evidence = Evidence {
+                        before: Some(before.location),
+                        after: after.deprecated,
+                        rule: None,
+                    };
+                    let problem = Problem::ApiDeprecated { api: prefix, how };
+                    return self.push(at, problem, Since::Upgrade, evidence);
+                }
+                // Attributes of a class or a function are not followed.
+                Lookup::Found(after) if after.module && before.module => continue,
+                Lookup::Found(_) | Lookup::Unknown => return,
+            };
+            let evidence = Evidence {
+                before: Some(before.location),
+                after: None,
+                rule: None,
+            };
+            return self.push(at, problem, Since::Upgrade, evidence);
+        }
+    }
+
+    /// `records.method(...)` on records of `model`: reported when the method
+    /// existed before, on the model or on every model through `BaseModel`.
+    fn method_call(&mut self, model: &ModelName, method: &str, how: ApiUse, at: &Location) {
+        let (source, target) = (&self.versions.source, &self.versions.target);
+        let (Some(before), Some(after)) = (source.models.get(model), target.models.get(model))
+        else {
+            return;
+        };
+        if after.has_method(method) || target.framework.is_empty() {
+            return;
+        }
+        let own = find_method(&source.models, model, method);
+        // A method only the modules being upgraded define is theirs.
+        if own.is_some_and(|found| {
+            found
+                .by_module
+                .keys()
+                .all(|module| self.versions.upgrading.contains(module))
+        }) {
+            return;
+        }
+        let base_before = source.framework.base_model(method);
+        let defined_before = before.has_method(method) && own.is_some();
+        if !defined_before && base_before.is_none() {
+            return;
+        }
+        let location_before = own
+            .map(|found| found.first.location.clone())
+            .or_else(|| base_before.map(|api| api.location.clone()));
+        let (problem, after_location) = match target.framework.base_model(method) {
+            None if defined_before => (
+                Problem::ApiGone {
+                    api: format!("{model}.{method}"),
+                    how,
+                },
+                None,
+            ),
+            None => (
+                Problem::ApiGone {
+                    api: format!("BaseModel.{method}"),
+                    how,
+                },
+                None,
+            ),
+            Some(api)
+                if !defined_before
+                    && api.deprecated.is_some()
+                    && base_before.is_some_and(|base| base.deprecated.is_none()) =>
+            {
+                (
+                    Problem::ApiDeprecated {
+                        api: format!("BaseModel.{method}"),
+                        how,
+                    },
+                    api.deprecated.clone(),
+                )
+            }
+            Some(_) => return,
+        };
+        let evidence = Evidence {
+            before: location_before,
+            after: after_location,
+            rule: None,
+        };
+        self.push(at, problem, Since::Upgrade, evidence);
     }
 
     /// `env["model"]`: reported only when the model existed before.

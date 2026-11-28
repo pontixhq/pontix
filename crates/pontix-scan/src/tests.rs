@@ -111,6 +111,7 @@ fn addons(version: OdooVersion, modules: Vec<Module>) -> Addons {
         version,
         modules,
         diagnostics: Vec::new(),
+        framework: Default::default(),
     }
 }
 
@@ -961,4 +962,150 @@ fn code_and_tests_report_only_what_existed_before() {
             .to_string(),
         Severity::Error
     )));
+}
+
+/// A framework tree of `files`, read as [`pontix_index::framework`] does.
+fn framework_of(files: &[(&str, &str)]) -> (tempfile::TempDir, pontix_index::Framework) {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    for (relative, content) in files {
+        let path = dir.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("directories");
+        std::fs::write(path, content).expect("a file");
+    }
+    let framework = pontix_index::framework(dir.path());
+    (dir, framework)
+}
+
+#[test]
+fn framework_names_and_model_methods_report_what_changed() {
+    let (_old, old) = framework_of(&[
+        ("odoo/__init__.py", ""),
+        (
+            "odoo/fields.py",
+            "def first(records):\n    return records[:1]\n",
+        ),
+        (
+            "odoo/tools/__init__.py",
+            "class ormcache_context:\n    pass\n",
+        ),
+        (
+            "odoo/models.py",
+            "class BaseModel:\n    def read_group(self): pass\n    def _where_calc(self): pass\n    def search(self): pass\n",
+        ),
+    ]);
+    let (_new, new) = framework_of(&[
+        (
+            "odoo/fields/__init__.py",
+            "from odoo.orm.domains import Domain\n",
+        ),
+        ("odoo/orm/domains.py", "class Domain: pass\n"),
+        (
+            "odoo/tools/__init__.py",
+            "import warnings\nclass ormcache_context:\n    def __init__(self):\n        warnings.warn('x', DeprecationWarning)\n",
+        ),
+        (
+            "odoo/orm/models.py",
+            "class BaseModel:\n    def read_group(self):\n        \"\"\"Deprecated - use _read_group\"\"\"\n    def search(self): pass\n",
+        ),
+    ]);
+    let code = |mut addons: Addons, framework: pontix_index::Framework| {
+        addons.framework = framework;
+        let custom = addons
+            .modules
+            .iter_mut()
+            .find(|module| module.name.as_str() == "custom_sale")
+            .expect("the custom module");
+        custom.models[0].methods[0].code_refs = vec![
+            code_ref(CodeRoot::Own, &["read_group"], CodeUse::Call, 70),
+            code_ref(
+                CodeRoot::Own,
+                &["partner_id", "_where_calc"],
+                CodeUse::Call,
+                71,
+            ),
+            code_ref(CodeRoot::Own, &["search"], CodeUse::Call, 72),
+            // Neither a model method nor a BaseModel one before.
+            code_ref(CodeRoot::Own, &["helper"], CodeUse::Call, 73),
+        ];
+        custom.code_refs = vec![
+            code_ref(
+                CodeRoot::Framework("odoo.tools.ormcache_context".to_string()),
+                &[],
+                CodeUse::Import,
+                80,
+            ),
+            code_ref(
+                CodeRoot::Framework("odoo.fields.first".to_string()),
+                &[],
+                CodeUse::Attribute,
+                81,
+            ),
+        ];
+        custom.test_refs = vec![code_ref(
+            CodeRoot::Framework("odoo.fields.first".to_string()),
+            &[],
+            CodeUse::Import,
+            90,
+        )];
+        addons
+    };
+    let scan = scan(
+        &code(source(), old),
+        &code(target(), new),
+        &[ModuleName::new("custom_sale")],
+        &[],
+    );
+    let found: Vec<(u32, Problem)> = in_code(scan.issues.clone())
+        .into_iter()
+        .filter(|issue| issue.at.file.ends_with("code.py"))
+        .map(|issue| (issue.at.line.get(), issue.problem))
+        .collect();
+    let api = |name: &str| name.to_string();
+    assert_eq!(
+        found,
+        [
+            (
+                70,
+                Problem::ApiDeprecated {
+                    api: api("BaseModel.read_group"),
+                    how: ApiUse::Call(name("sale.order")),
+                }
+            ),
+            (
+                71,
+                Problem::ApiGone {
+                    api: api("BaseModel._where_calc"),
+                    how: ApiUse::Call(name("res.partner")),
+                }
+            ),
+            (
+                80,
+                Problem::ApiDeprecated {
+                    api: api("odoo.tools.ormcache_context"),
+                    how: ApiUse::Import,
+                }
+            ),
+            (
+                81,
+                Problem::ApiGone {
+                    api: api("odoo.fields.first"),
+                    how: ApiUse::Attribute,
+                }
+            ),
+            (
+                90,
+                Problem::ApiGone {
+                    api: api("odoo.fields.first"),
+                    how: ApiUse::Test(Box::new(ApiUse::Import)),
+                }
+            ),
+        ]
+    );
+    let findings = report(&scan).findings;
+    let first: Vec<Severity> = findings
+        .iter()
+        .filter(|finding| finding.subject == "odoo.fields.first")
+        .map(|finding| finding.severity)
+        .collect();
+    assert_eq!(first, [Severity::Error, Severity::Warning]);
 }

@@ -54,6 +54,10 @@ pub enum PtxCode {
     P403,
     /// A core method the module overrides without `super()` is gone.
     P404,
+    /// A framework name or model method the module uses is gone.
+    A101,
+    /// A framework name or model method the module uses is deprecated.
+    A102,
     /// A record the module refers to by external id is gone.
     R601,
     /// A stored column or table goes away, and its data with it.
@@ -86,6 +90,8 @@ impl PtxCode {
             Self::P402 => "PTX-P402",
             Self::P403 => "PTX-P403",
             Self::P404 => "PTX-P404",
+            Self::A101 => "PTX-A101",
+            Self::A102 => "PTX-A102",
             Self::R601 => "PTX-R601",
             Self::D901 => "PTX-D901",
             Self::D902 => "PTX-D902",
@@ -101,6 +107,7 @@ impl PtxCode {
             | Self::P402
             | Self::P403
             | Self::P404
+            | Self::A102
             | Self::D902
             | Self::D903 => Severity::Warning,
             _ => Severity::Error,

@@ -284,6 +284,35 @@ pub enum Problem {
         /// Its model name in the target version.
         to: ModelName,
     },
+    /// A framework name or model method the module uses is gone.
+    ApiGone {
+        /// The name, such as `odoo.tools.ormcache_context` or
+        /// `BaseModel._where_calc`.
+        api: String,
+        /// How the module uses it.
+        how: ApiUse,
+    },
+    /// A framework name or model method the module uses is deprecated in
+    /// the target version.
+    ApiDeprecated {
+        /// The name, as in [`Problem::ApiGone`].
+        api: String,
+        /// How the module uses it.
+        how: ApiUse,
+    },
+}
+
+/// How a module uses a framework name or a method of a model.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ApiUse {
+    /// Imports it.
+    Import,
+    /// Reaches it as an attribute of a module it imports.
+    Attribute,
+    /// Calls it on records of the model.
+    Call(ModelName),
+    /// Any of these, in the module's tests.
+    Test(Box<ApiUse>),
 }
 
 /// Checks `upgrading`, found in both `source` and `target`, for what the
@@ -314,8 +343,8 @@ pub fn scan(
     let changes = pontix_diff::diff(&core_source, &core_target);
 
     let mut issues = check::check(&check::Versions {
-        source: check::Side::new(&full_source, &core_source),
-        target: check::Side::new(&full_target, &core_target),
+        source: check::Side::new(&full_source, &core_source, &source.framework),
+        target: check::Side::new(&full_target, &core_target, &target.framework),
         upgrading,
         changes: &changes,
     });

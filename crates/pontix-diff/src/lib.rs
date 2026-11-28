@@ -395,11 +395,13 @@ mod tests {
         let source = Addons {
             version: OdooVersion::V18,
             diagnostics: Vec::new(),
+            framework: Default::default(),
             modules: source,
         };
         let target = Addons {
             version: OdooVersion::V19,
             diagnostics: Vec::new(),
+            framework: Default::default(),
             modules: target,
         };
         let from = install(&source, &all(&source.modules), &[]);
@@ -771,11 +773,13 @@ mod tests {
         let source = Addons {
             version: OdooVersion::V18,
             diagnostics: Vec::new(),
+            framework: Default::default(),
             modules: source,
         };
         let target = Addons {
             version: OdooVersion::V19,
             diagnostics: Vec::new(),
+            framework: Default::default(),
             modules: target,
         };
         let set = diff(

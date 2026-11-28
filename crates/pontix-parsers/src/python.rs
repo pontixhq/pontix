@@ -6,6 +6,7 @@
 
 mod code;
 mod field;
+pub mod framework;
 mod method;
 mod module_level;
 
@@ -20,7 +21,7 @@ use ruff_python_ast::{Expr, ExprList, ExprName, ExprTuple, Stmt, StmtClassDef};
 use ruff_python_parser::parse_module;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
-use self::code::Owner;
+use self::code::{Aliases, Context, Owner};
 use self::field::{Comodel, Field};
 pub use self::module_level::Import;
 use crate::source::SourceFile;
@@ -106,6 +107,7 @@ pub fn parse_python_with(file: &Path, source: &str, read_code: bool) -> PythonFi
     let mut reader = Reader {
         source: SourceFile::new(file, source),
         read_code,
+        aliases: Aliases::new(),
         out: PythonFile::default(),
     };
     match parse_module(source) {
@@ -113,11 +115,20 @@ pub fn parse_python_with(file: &Path, source: &str, read_code: bool) -> PythonFi
             let module_level = module_level::module_level(&reader.source, &parsed.syntax().body);
             reader.out.imports = module_level.imports;
             reader.out.bound_names = module_level.bound_names;
+            if reader.read_code {
+                let (aliases, imports) = code::aliases(&reader.source, &parsed.syntax().body);
+                reader.aliases = aliases;
+                reader.out.code_refs.extend(imports);
+            }
             for stmt in &parsed.syntax().body {
                 match stmt {
                     Stmt::ClassDef(class) => reader.class(class),
                     Stmt::FunctionDef(def) if reader.read_code => {
-                        let refs = code::refs(&reader.source, def, Owner::Function);
+                        let context = Context {
+                            owner: Owner::Function,
+                            aliases: &reader.aliases,
+                        };
+                        let refs = code::refs(&reader.source, def, context);
                         reader.out.code_refs.extend(refs);
                     }
                     Stmt::FunctionDef(_) => {}
@@ -146,6 +157,8 @@ struct Reader<'a> {
     source: SourceFile<'a>,
     /// Whether to read what bodies use.
     read_code: bool,
+    /// The framework names the file imports.
+    aliases: Aliases,
     out: PythonFile,
 }
 
@@ -210,10 +223,14 @@ impl Reader<'_> {
         if !self.read_code {
             return;
         }
-        let attributes = code::attributes(&self.source, class);
+        let attributes = code::attributes(&self.source, class, &self.aliases);
         for stmt in &class.body {
             if let Stmt::FunctionDef(def) = stmt {
-                let refs = code::refs(&self.source, def, Owner::Plain(&attributes));
+                let context = Context {
+                    owner: Owner::Plain(&attributes),
+                    aliases: &self.aliases,
+                };
+                let refs = code::refs(&self.source, def, context);
                 self.out.code_refs.extend(refs);
             }
         }
@@ -258,7 +275,11 @@ impl Reader<'_> {
                         })
                         .collect(),
                     code_refs: if own_refs && self.read_code {
-                        code::refs(&self.source, def, Owner::Model)
+                        let context = Context {
+                            owner: Owner::Model,
+                            aliases: &self.aliases,
+                        };
+                        code::refs(&self.source, def, context)
                     } else {
                         Vec::new()
                     },

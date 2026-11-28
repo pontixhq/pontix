@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use pontix_core::{ModuleName, OdooVersion, Severity};
-use pontix_index::{ScanOptions, scan_with};
+use pontix_index::{ScanOptions, framework, scan_with};
 use pontix_parsers::release_version;
 
 use crate::output::{self, Notice, Roots};
@@ -111,8 +111,10 @@ pub(crate) fn plan(args: &PlanArgs, color: bool) -> Result<(String, Outcome), St
     let options = ScanOptions {
         read_code_in: &args.addons,
     };
-    let source = scan_with(&paths(&args.core_from), args.from, options);
-    let target = scan_with(&paths(&args.core_to), args.to, options);
+    let mut source = scan_with(&paths(&args.core_from), args.from, options);
+    let mut target = scan_with(&paths(&args.core_to), args.to, options);
+    source.framework = framework(&args.core_from);
+    target.framework = framework(&args.core_to);
     let scan = pontix_scan::scan(&source, &target, &found, &[]);
     let mut report = pontix_scan::report(&scan);
     // The report is about the chosen modules and the core they install.

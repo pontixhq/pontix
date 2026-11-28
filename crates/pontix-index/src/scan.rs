@@ -12,6 +12,7 @@ use pontix_parsers::{parse_manifest, parse_xml};
 
 use crate::bases;
 use crate::files::{Root, whole_file};
+use crate::framework::Framework;
 use crate::load::{Class, PythonSource, load, load_tests};
 
 /// One Odoo module and what Odoo would load from it.
@@ -50,6 +51,11 @@ pub struct Addons {
     pub modules: Vec<Module>,
     /// Everything that could not be read, across all modules.
     pub diagnostics: Vec<Diagnostic>,
+    /// The framework the modules run on, when read with [`framework`]:
+    /// empty otherwise, and then nothing is checked against it.
+    ///
+    /// [`framework`]: crate::framework()
+    pub framework: Framework,
 }
 
 /// Finds the modules in `addons_paths` as `version` would: a module is a
@@ -79,6 +85,7 @@ pub fn scan_with(
         version,
         modules: Vec::new(),
         diagnostics: Vec::new(),
+        framework: Framework::default(),
     };
     let mut seen = HashSet::new();
     let mut pending = Pending::default();
@@ -631,8 +638,15 @@ mod tests {
         assert_eq!(kinds(&addons), [DiagnosticKind::OutsideRoot]);
     }
 
+    /// The field paths of `refs`: method calls and framework names left out.
     fn ref_paths(refs: &[CodeRef]) -> Vec<String> {
-        refs.iter().map(|found| found.path.join(".")).collect()
+        refs.iter()
+            .filter(|found| {
+                found.how != pontix_core::CodeUse::Call
+                    && !matches!(found.root, pontix_core::CodeRoot::Framework(_))
+            })
+            .map(|found| found.path.join("."))
+            .collect()
     }
 
     fn lines(lines: &[&str]) -> String {

@@ -16,3 +16,6 @@ workspace = true
 pontix-core = { path = "../pontix-core" }
 pontix-diff = { path = "../pontix-diff" }
 pontix-index = { path = "../pontix-index" }
+
+[dev-dependencies]
+tempfile = "3"

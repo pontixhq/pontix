@@ -326,6 +326,7 @@ mod tests {
             version,
             modules,
             diagnostics: Vec::new(),
+            framework: Default::default(),
         }
     }
 

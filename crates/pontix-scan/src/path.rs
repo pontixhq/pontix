@@ -67,6 +67,31 @@ pub(crate) fn walk(
     Walk::Reaches
 }
 
+/// The model whose records `path` gives from `start`, when every field it
+/// names exists and is relational with a known comodel. An empty path gives
+/// `start` itself.
+pub(crate) fn reach(
+    models: &BTreeMap<ModelName, ModelView<'_>>,
+    start: &ModelName,
+    path: &[String],
+) -> Option<ModelName> {
+    let mut model = start.clone();
+    for segment in path {
+        let view = models.get(&model)?;
+        let field = FieldName::new(segment.as_str());
+        let comodel = if let Some(found) = lookup(view, &field) {
+            found.comodel.map(|(comodel, _)| comodel.clone())
+        } else {
+            MAGIC_FIELDS
+                .iter()
+                .find(|(name, _)| *name == segment)
+                .and_then(|(_, comodel)| comodel.map(ModelName::new))
+        };
+        model = comodel?;
+    }
+    models.contains_key(&model).then_some(model)
+}
+
 /// A field the model has: own, inherited, or through delegation.
 pub(crate) fn lookup<'v, 'a>(
     view: &'v ModelView<'a>,

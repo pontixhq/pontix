@@ -10,7 +10,7 @@ use pontix_core::{
     ModelKind, ModelName, ModuleName, Rename, View, Written, XmlRef,
 };
 use pontix_index::registry::{self, MethodView, ModelView, Xmlid, qualified};
-use pontix_index::{Installation, Module};
+use pontix_index::{Framework, Installation, Module};
 
 use crate::path::{Walk, lookup, walk};
 
@@ -37,10 +37,16 @@ pub(crate) struct Side<'i, 'a> {
     core_defined: BTreeSet<ModelName>,
     /// Every external id, the upgraded modules' records included.
     xmlids: BTreeMap<String, Xmlid<'a>>,
+    /// The framework, empty when it was not read.
+    framework: &'a Framework,
 }
 
 impl<'i, 'a> Side<'i, 'a> {
-    pub(crate) fn new(full: &'i Installation<'a>, core: &Installation<'a>) -> Self {
+    pub(crate) fn new(
+        full: &'i Installation<'a>,
+        core: &Installation<'a>,
+        framework: &'a Framework,
+    ) -> Self {
         Self {
             full,
             models: registry::models(full),
@@ -48,6 +54,7 @@ impl<'i, 'a> Side<'i, 'a> {
             defined: defined(full),
             core_defined: defined(core),
             xmlids: registry::xmlids(full),
+            framework,
         }
     }
 }
