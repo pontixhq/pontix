@@ -1110,3 +1110,48 @@ fn framework_names_and_model_methods_report_what_changed() {
         .collect();
     assert_eq!(first, [Severity::Error, Severity::Warning]);
 }
+
+#[test]
+fn a_field_only_another_module_declares_is_not_there_for_this_one() {
+    // Another module being upgraded declares `fax` again, but custom_sale
+    // does not depend on it: for custom_sale the field is still gone.
+    let with_other = |mut addons: Addons| {
+        addons.modules.push(module(
+            "partner_fax",
+            &["base"],
+            Some("18.0.1.0.0"),
+            vec![model(
+                "partner_fax/models.py",
+                "res.partner",
+                extends("res.partner"),
+                vec![field(
+                    "partner_fax/models.py",
+                    "fax",
+                    FieldType::Char,
+                    None,
+                    5,
+                )],
+                vec![],
+            )],
+        ));
+        addons
+    };
+    let upgrading = [
+        ModuleName::new("custom_sale"),
+        ModuleName::new("partner_fax"),
+    ];
+    let scan = scan(
+        &with_other(source()),
+        &with_other(target()),
+        &upgrading,
+        &[],
+    );
+    let fax: Vec<(&str, &Problem)> = scan
+        .issues
+        .iter()
+        .filter(|issue| matches!(&issue.problem, Problem::FieldGone { field, .. } if field.as_str() == "fax"))
+        .map(|issue| (issue.module.as_str(), &issue.problem))
+        .collect();
+    assert_eq!(fax.len(), 1, "{fax:?}");
+    assert_eq!(fax[0].0, "custom_sale");
+}

@@ -12,7 +12,7 @@ use pontix_core::{
 use pontix_index::registry::{self, MethodView, ModelView, Xmlid, qualified};
 use pontix_index::{Framework, Installation, Module};
 
-use crate::path::{Walk, lookup, walk};
+use crate::path::{Scope, Walk, lookup, walk};
 
 mod code;
 use crate::{Evidence, Issue, ModelUse, PathUse, Problem, Renamed, Since};
@@ -30,11 +30,11 @@ pub(crate) struct Side<'i, 'a> {
     models: BTreeMap<ModelName, ModelView<'a>>,
     /// Every core model.
     core: BTreeMap<ModelName, ModelView<'a>>,
-    /// Models some class defines rather than only extends: a model only
-    /// extended does not exist in Odoo.
-    defined: BTreeSet<ModelName>,
-    /// The same, for core alone.
+    /// Models a core class defines rather than only extends.
     core_defined: BTreeSet<ModelName>,
+    /// The modules whose classes define each model, rather than only
+    /// extend it: a model only extended does not exist in Odoo.
+    definers: BTreeMap<ModelName, BTreeSet<ModuleName>>,
     /// Every external id, the upgraded modules' records included.
     xmlids: BTreeMap<String, Xmlid<'a>>,
     /// The framework, empty when it was not read.
@@ -51,12 +51,36 @@ impl<'i, 'a> Side<'i, 'a> {
             full,
             models: registry::models(full),
             core: registry::models(core),
-            defined: defined(full),
             core_defined: defined(core),
+            definers: definers(full),
             xmlids: registry::xmlids(full),
             framework,
         }
     }
+}
+
+impl Side<'_, '_> {
+    /// Whether a module in scope defines the model.
+    fn defines(&self, model: &ModelName, scope: Scope<'_>) -> bool {
+        self.definers
+            .get(model)
+            .is_some_and(|modules| modules.iter().any(|module| scope.has(module)))
+    }
+}
+
+fn definers(installation: &Installation<'_>) -> BTreeMap<ModelName, BTreeSet<ModuleName>> {
+    installation
+        .models()
+        .into_iter()
+        .map(|(name, definitions)| {
+            let modules = definitions
+                .iter()
+                .filter(|definition| definition.kind != ModelKind::Extension)
+                .map(|definition| definition.module.name.clone())
+                .collect();
+            (name, modules)
+        })
+        .collect()
 }
 
 fn defined(installation: &Installation<'_>) -> BTreeSet<ModelName> {
@@ -72,12 +96,20 @@ fn defined(installation: &Installation<'_>) -> BTreeSet<ModelName> {
         .collect()
 }
 
+/// For each module being upgraded, the modules it installs in the source
+/// and in the target version. `None` on a side stands for every module, as
+/// when a dependency cannot be installed there.
+pub(crate) type Scopes =
+    BTreeMap<ModuleName, (Option<BTreeSet<ModuleName>>, Option<BTreeSet<ModuleName>>)>;
+
 /// Both versions and what is checked between them.
 pub(crate) struct Versions<'s, 'i, 'a> {
     pub(crate) source: Side<'i, 'a>,
     pub(crate) target: Side<'i, 'a>,
     pub(crate) upgrading: &'s [ModuleName],
     pub(crate) changes: &'s ChangeSet,
+    /// What each module being upgraded can rely on.
+    pub(crate) scopes: &'s Scopes,
 }
 
 pub(crate) fn check(versions: &Versions<'_, '_, '_>) -> Vec<Issue> {
@@ -98,9 +130,14 @@ pub(crate) fn check(versions: &Versions<'_, '_, '_>) -> Vec<Issue> {
         {
             continue;
         }
+        let scope = match versions.scopes.get(&module.name) {
+            Some((source, target)) => (scope_of(source.as_ref()), scope_of(target.as_ref())),
+            None => (Scope::All, Scope::All),
+        };
         let mut checker = Checker {
             versions,
             module: &module.name,
+            scope,
             issues: &mut issues,
         };
         for def in &module.models {
@@ -110,6 +147,11 @@ pub(crate) fn check(versions: &Versions<'_, '_, '_>) -> Vec<Issue> {
         checker.code(module);
     }
     issues
+}
+
+/// `None` stands for every module.
+fn scope_of(modules: Option<&BTreeSet<ModuleName>>) -> Scope<'_> {
+    modules.map_or(Scope::All, Scope::Modules)
 }
 
 /// Dependencies the target version cannot install.
@@ -187,6 +229,8 @@ fn dependencies(versions: &Versions<'_, '_, '_>, issues: &mut Vec<Issue>) {
 struct Checker<'c, 's, 'i, 'a> {
     versions: &'c Versions<'s, 'i, 'a>,
     module: &'c ModuleName,
+    /// What the module can rely on in the source and in the target version.
+    scope: (Scope<'c>, Scope<'c>),
     issues: &'c mut Vec<Issue>,
 }
 
@@ -217,7 +261,7 @@ impl Checker<'_, '_, '_, '_> {
         }
         // Nothing else of a class can work on a model that is gone.
         if model_kind(def, source.full.version) == ModelKind::Extension
-            && !target.defined.contains(&name)
+            && !target.defines(&name, self.scope.1)
         {
             return;
         }
@@ -287,7 +331,7 @@ impl Checker<'_, '_, '_, '_> {
             }
             for record in &file.records {
                 self.model(&record.model, ModelUse::Record, &record.location);
-                if !self.versions.target.defined.contains(&record.model) {
+                if !self.versions.target.defines(&record.model, self.scope.1) {
                     continue;
                 }
                 let id = record
@@ -371,10 +415,16 @@ impl Checker<'_, '_, '_, '_> {
             return;
         }
         let (source, target) = (&self.versions.source, &self.versions.target);
-        if target.xmlids.contains_key(&id) {
+        // A record is only there for a module that installs its owner.
+        let owner = ModuleName::new(owner);
+        if target.xmlids.contains_key(&id) && self.scope.1.has(&owner) {
             return;
         }
-        let before = source.xmlids.get(&id).map(|found| found.location.clone());
+        let before = source
+            .xmlids
+            .get(&id)
+            .filter(|_| self.scope.0.has(&owner))
+            .map(|found| found.location.clone());
         let existed = before.is_some();
         self.push(
             &reference.location,
@@ -394,10 +444,10 @@ impl Checker<'_, '_, '_, '_> {
     /// A model the class inherits, delegates to or points a field at.
     fn model(&mut self, model: &ModelName, how: ModelUse, at: &Location) {
         let (source, target) = (&self.versions.source, &self.versions.target);
-        if target.defined.contains(model) {
+        if target.defines(model, self.scope.1) {
             return;
         }
-        let existed = source.defined.contains(model);
+        let existed = source.defines(model, self.scope.0);
         let renamed = existed
             .then(|| {
                 self.versions
@@ -445,14 +495,18 @@ impl Checker<'_, '_, '_, '_> {
         let (source, target) = (&self.versions.source, &self.versions.target);
         // A model that is gone is reported where it is used; its fields would
         // only repeat that.
-        if !target.defined.contains(model) {
+        if !target.defines(model, self.scope.1) {
             return;
         }
-        let Walk::Missing { model: on, field } = walk(&target.models, model, path) else {
+        let Walk::Missing { model: on, field } = walk(&target.models, self.scope.1, model, path)
+        else {
             return;
         };
-        let worked = walk(&source.models, model, path) == Walk::Reaches;
-        let existing = source.models.get(&on).and_then(|view| lookup(view, &field));
+        let worked = walk(&source.models, self.scope.0, model, path) == Walk::Reaches;
+        let existing = source
+            .models
+            .get(&on)
+            .and_then(|view| lookup(view, &field, self.scope.0));
         // A field of a module being upgraded disappears only when its class
         // no longer applies, which is reported on the class.
         if existing.is_some_and(|found| self.versions.upgrading.contains(found.owner)) {

@@ -80,6 +80,9 @@ impl<'a> ModelView<'a> {
 pub struct FieldView<'a> {
     /// The module whose definition declares the field first.
     pub owner: &'a ModuleName,
+    /// Every module whose definitions declare it. A field is only there
+    /// for a module that installs one of them.
+    pub modules: BTreeSet<&'a ModuleName>,
     /// The first declaration.
     pub first: &'a Location,
     /// The type of the last declaration, which is the one Odoo keeps.
@@ -163,12 +166,14 @@ pub fn models<'a>(installation: &Installation<'a>) -> BTreeMap<ModelName, ModelV
             for field in &definition.def.fields {
                 let entry = view.fields.entry(&field.name).or_insert(FieldView {
                     owner: &definition.module.name,
+                    modules: BTreeSet::new(),
                     first: &field.location,
                     field_type: &field.field_type,
                     type_at: &field.location,
                     comodel: None,
                     attrs: FieldAttrs::default(),
                 });
+                entry.modules.insert(&definition.module.name);
                 entry.redeclare(&field.field_type, &field.attrs);
                 entry.field_type = &field.field_type;
                 entry.type_at = &field.location;
@@ -250,9 +255,13 @@ fn inherit<'a>(views: &mut BTreeMap<ModelName, ModelView<'a>>) {
         // A model's own declaration of a field it also inherits builds on
         // the inherited one, as Odoo merges the arguments of every class.
         for (field, own) in &mut view.fields {
-            if let Some(inherited) = fields.get(field)
-                && inherited.field_type == own.field_type
-            {
+            let Some(inherited) = fields.get(field) else {
+                continue;
+            };
+            // The field is there for a module that installs either
+            // declaration.
+            own.modules.extend(inherited.modules.iter().copied());
+            if inherited.field_type == own.field_type {
                 own.attrs = storage::merge(&inherited.attrs, &own.attrs);
             }
         }

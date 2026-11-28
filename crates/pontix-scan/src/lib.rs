@@ -23,9 +23,11 @@ mod path;
 
 pub use findings::{NOT_COVERED, Report, report};
 
+use std::collections::BTreeSet;
+
 use pontix_core::{
-    ChangeSet, CodeUse, Confidence, FieldName, FieldType, Location, ModelName, ModuleName, RefKind,
-    Storage,
+    ChangeSet, CodeUse, Confidence, DiagnosticKind, FieldName, FieldType, Location, ModelName,
+    ModuleName, RefKind, Storage,
 };
 use pontix_index::{Addons, InstallOptions, install, install_with};
 
@@ -342,11 +344,42 @@ pub fn scan(
     let core_target = install(target, &core, company_countries);
     let changes = pontix_diff::diff(&core_source, &core_target);
 
+    // Each module is checked against what it installs itself, not against
+    // everything the modules being upgraded install together.
+    let in_target: BTreeSet<&ModuleName> = full_target
+        .modules
+        .iter()
+        .map(|module| &module.name)
+        .collect();
+    let scopes = upgrading
+        .iter()
+        .map(|module| {
+            let (before, complete) = installs(source, module, &options);
+            // Pontix cannot tell what a module whose dependencies are missing
+            // already relies on: every module counts then.
+            let before = complete.then_some(before);
+            let after = before.as_ref().map(|before| {
+                // A dependency that is gone is reported on the manifest; what
+                // the module reached through it and is still there counts,
+                // or everything behind it would be reported again.
+                let (mut after, _) = installs(target, module, &options);
+                after.extend(
+                    before
+                        .iter()
+                        .filter(|name| in_target.contains(name))
+                        .cloned(),
+                );
+                after
+            });
+            (module.clone(), (before, after))
+        })
+        .collect();
     let mut issues = check::check(&check::Versions {
         source: check::Side::new(&full_source, &core_source, &source.framework),
         target: check::Side::new(&full_target, &core_target, &target.framework),
         upgrading,
         changes: &changes,
+        scopes: &scopes,
     });
     issues.extend(manifest::check(source, target, upgrading));
     issues.extend(data::check(&changes, &core_source));
@@ -354,6 +387,29 @@ pub fn scan(
         (&a.module, &a.at.file, a.at.line).cmp(&(&b.module, &b.at.file, b.at.line))
     });
     Scan { issues, changes }
+}
+
+/// The modules `module` installs on its own, and whether all of its
+/// dependencies could be installed.
+fn installs(
+    addons: &Addons,
+    module: &ModuleName,
+    options: &InstallOptions<'_>,
+) -> (BTreeSet<ModuleName>, bool) {
+    let installation = install_with(addons, std::slice::from_ref(module), options);
+    let incomplete = !installation.unknown.is_empty()
+        || installation.diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.kind,
+                DiagnosticKind::MissingDependency | DiagnosticKind::DependencyNotInstallable
+            )
+        });
+    let modules = installation
+        .modules
+        .iter()
+        .map(|installed| installed.name.clone())
+        .collect();
+    (modules, !incomplete)
 }
 
 #[cfg(test)]

@@ -68,7 +68,8 @@ impl Checker<'_, '_, '_, '_> {
             let Some((method, path)) = found.path.split_last() else {
                 return;
             };
-            let Some(model) = reach(&self.versions.source.models, &start, path) else {
+            let Some(model) = reach(&self.versions.source.models, self.scope.0, &start, path)
+            else {
                 return;
             };
             let how = tested(ApiUse::Call(model.clone()));
@@ -193,7 +194,7 @@ impl Checker<'_, '_, '_, '_> {
 
     /// `env["model"]`: reported only when the model existed before.
     fn code_model(&mut self, model: &ModelName, how: ModelUse, at: &Location) {
-        if self.versions.source.defined.contains(model) {
+        if self.versions.source.defines(model, self.scope.0) {
             self.model(model, how, at);
         }
     }
@@ -203,7 +204,7 @@ impl Checker<'_, '_, '_, '_> {
     fn code_path(&mut self, start: &ModelName, path: &[String], how: PathUse, at: &Location) {
         let (source, target) = (&self.versions.source, &self.versions.target);
         // A model that is gone is reported where the code opens it.
-        if !source.defined.contains(start) || !target.defined.contains(start) {
+        if !source.defines(start, self.scope.0) || !target.defines(start, self.scope.1) {
             return;
         }
         let mut prefix = String::new();
@@ -212,13 +213,19 @@ impl Checker<'_, '_, '_, '_> {
                 prefix.push('.');
             }
             prefix.push_str(segment);
-            let Walk::Missing { model: on, field } = walk(&target.models, start, &prefix) else {
+            let Walk::Missing { model: on, field } =
+                walk(&target.models, self.scope.1, start, &prefix)
+            else {
                 continue;
             };
-            if walk(&source.models, start, &prefix) != Walk::Reaches {
+            if walk(&source.models, self.scope.0, start, &prefix) != Walk::Reaches {
                 return;
             }
-            let Some(found) = source.models.get(&on).and_then(|view| lookup(view, &field)) else {
+            let Some(found) = source
+                .models
+                .get(&on)
+                .and_then(|view| lookup(view, &field, self.scope.0))
+            else {
                 return;
             };
             // A field of a module being upgraded disappears only when its

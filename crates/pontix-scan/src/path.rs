@@ -1,9 +1,9 @@
 //! Field paths such as `order_id.partner_id.country_id`, followed model by
 //! model through each relational field's comodel.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use pontix_core::{FieldName, ModelName};
+use pontix_core::{FieldName, ModelName, ModuleName};
 use pontix_index::registry::{FieldView, ModelView};
 
 /// Fields every model has without declaring them, with their comodel
@@ -16,6 +16,33 @@ const MAGIC_FIELDS: [(&str, Option<&str>); 6] = [
     ("create_uid", Some("res.users")),
     ("write_uid", Some("res.users")),
 ];
+
+/// The modules a check may rely on: those the checked module installs,
+/// its dependencies and the `auto_install` modules they bring. A name that
+/// only other modules declare is not there for it, even when an installation
+/// holding every module being upgraded has it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Scope<'s> {
+    /// Every module of the installation.
+    All,
+    /// Only these.
+    Modules(&'s BTreeSet<ModuleName>),
+}
+
+impl Scope<'_> {
+    /// Whether the module is in scope.
+    pub(crate) fn has(self, module: &ModuleName) -> bool {
+        match self {
+            Self::All => true,
+            Self::Modules(modules) => modules.contains(module),
+        }
+    }
+
+    /// Whether a module in scope declares the field.
+    pub(crate) fn has_field(self, field: &FieldView<'_>) -> bool {
+        field.modules.iter().any(|module| self.has(module))
+    }
+}
 
 /// How far a path gets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +62,7 @@ pub(crate) enum Walk {
 /// Follows `path` from `start`.
 pub(crate) fn walk(
     models: &BTreeMap<ModelName, ModelView<'_>>,
+    scope: Scope<'_>,
     start: &ModelName,
     path: &str,
 ) -> Walk {
@@ -49,7 +77,7 @@ pub(crate) fn walk(
             return Walk::Reaches;
         };
         let field = FieldName::new(segment);
-        let comodel = if let Some(found) = lookup(view, &field) {
+        let comodel = if let Some(found) = lookup(view, &field, scope) {
             found.comodel.map(|(comodel, _)| comodel.clone())
         } else if let Some((_, comodel)) = MAGIC_FIELDS.iter().find(|(name, _)| *name == segment) {
             comodel.map(ModelName::new)
@@ -72,6 +100,7 @@ pub(crate) fn walk(
 /// `start` itself.
 pub(crate) fn reach(
     models: &BTreeMap<ModelName, ModelView<'_>>,
+    scope: Scope<'_>,
     start: &ModelName,
     path: &[String],
 ) -> Option<ModelName> {
@@ -79,7 +108,7 @@ pub(crate) fn reach(
     for segment in path {
         let view = models.get(&model)?;
         let field = FieldName::new(segment.as_str());
-        let comodel = if let Some(found) = lookup(view, &field) {
+        let comodel = if let Some(found) = lookup(view, &field, scope) {
             found.comodel.map(|(comodel, _)| comodel.clone())
         } else {
             MAGIC_FIELDS
@@ -92,11 +121,17 @@ pub(crate) fn reach(
     models.contains_key(&model).then_some(model)
 }
 
-/// A field the model has: own, inherited, or through delegation.
+/// A field the model has, own, inherited, or through delegation, that a
+/// module in scope declares.
 pub(crate) fn lookup<'v, 'a>(
     view: &'v ModelView<'a>,
     field: &FieldName,
+    scope: Scope<'_>,
 ) -> Option<&'v FieldView<'a>> {
-    view.field(field)
-        .or_else(|| view.delegated_fields.get(field))
+    // A model's own declaration may come from a module out of scope while
+    // the field it inherits does not.
+    [&view.fields, &view.inherited_fields, &view.delegated_fields]
+        .into_iter()
+        .filter_map(|fields| fields.get(field))
+        .find(|found| scope.has_field(found))
 }
