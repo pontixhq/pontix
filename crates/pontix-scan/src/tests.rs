@@ -774,13 +774,14 @@ fn findings_group_issues_with_a_code_severity_and_basis() {
                 "sale.order.action_confirm",
                 1
             ),
+            (PtxCode::F201, Severity::Info, "sale.order.ghost", 1),
+            // An override calling super() is only a hint.
             (
                 PtxCode::P403,
-                Severity::Warning,
+                Severity::Info,
                 "sale.order._prepare_invoice",
                 1
             ),
-            (PtxCode::F201, Severity::Info, "sale.order.ghost", 1),
         ]
     );
     let manifest = report

@@ -286,19 +286,26 @@ fn classify(issue: &Issue, target: &str) -> Classified {
             model,
             method,
             calls_super,
-        } => plain(
-            PtxCode::P403,
-            format!("{model}.{method}"),
-            if *calls_super {
-                format!(
-                    "Core logic this override of {model}.{method} extends changed in {target}: check its behavior."
-                )
-            } else {
-                format!(
-                    "Core code this override of {model}.{method} replaces changed in {target}: the override may be an outdated copy."
-                )
-            },
-        ),
+        } => Classified {
+            // Core methods that overrides extend change in most releases:
+            // measured on 10 OCA repositories, an override calling super()
+            // rarely needed a change, so it is only a hint. An override
+            // that replaces core logic may be an outdated copy of it.
+            severity: calls_super.then_some(Severity::Info),
+            ..plain(
+                PtxCode::P403,
+                format!("{model}.{method}"),
+                if *calls_super {
+                    format!(
+                        "Core logic this override of {model}.{method} extends changed in {target}: check its behavior."
+                    )
+                } else {
+                    format!(
+                        "Core code this override of {model}.{method} replaces changed in {target}: the override may be an outdated copy."
+                    )
+                },
+            )
+        },
         Problem::RecordGone { xmlid, how } => plain(
             PtxCode::R601,
             xmlid.clone(),
