@@ -18,6 +18,9 @@ pub enum PtxCode {
     /// The manifest version is of another series: Odoo skips the module
     /// without an error.
     M002,
+    /// A `migrations/` folder holds scripts for versions below the target
+    /// series: they never run again.
+    M003,
     /// A class with an `_inherit` list and no `_name` gets another model
     /// name.
     M004,
@@ -67,6 +70,7 @@ impl PtxCode {
         match self {
             Self::M001 => "PTX-M001",
             Self::M002 => "PTX-M002",
+            Self::M003 => "PTX-M003",
             Self::M004 => "PTX-M004",
             Self::M005 => "PTX-M005",
             Self::M006 => "PTX-M006",
@@ -92,9 +96,13 @@ impl PtxCode {
     /// The severity the code has when the upgrade causes it.
     pub fn severity(self) -> Severity {
         match self {
-            Self::F205 | Self::P402 | Self::P403 | Self::P404 | Self::D902 | Self::D903 => {
-                Severity::Warning
-            }
+            Self::M003
+            | Self::F205
+            | Self::P402
+            | Self::P403
+            | Self::P404
+            | Self::D902
+            | Self::D903 => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -105,6 +113,7 @@ impl PtxCode {
             Self::D901 => Category::DataLoss,
             Self::D902 | Self::D903 => Category::DataRisk,
             Self::F205 | Self::P402 | Self::P403 | Self::P404 => Category::Behavior,
+            Self::M003 => Category::Housekeeping,
             _ => Category::CodeBreak,
         }
     }
@@ -149,6 +158,8 @@ pub enum Category {
     DataRisk,
     /// Code that runs but may do something else.
     Behavior,
+    /// Code or files left behind that no longer do anything.
+    Housekeeping,
 }
 
 impl Category {
@@ -159,6 +170,7 @@ impl Category {
             Self::DataLoss => "data_loss",
             Self::DataRisk => "data_risk",
             Self::Behavior => "behavior",
+            Self::Housekeeping => "housekeeping",
         }
     }
 }

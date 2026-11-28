@@ -72,9 +72,12 @@ pub(crate) fn plan(args: &PlanArgs, color: bool) -> Result<(String, Outcome), St
             return Err(format!("--addons {} is not a folder", dir.display()));
         }
     }
+    // Every module of the addons folders is upgraded with the others, so a
+    // dependency between them is not reported as missing. `--modules` only
+    // narrows which ones the report is about.
     let found = custom_modules(&args.addons, args.from);
-    let upgrading: Vec<ModuleName> = if args.modules.is_empty() {
-        found
+    let selected: Vec<ModuleName> = if args.modules.is_empty() {
+        found.clone()
     } else {
         let mut chosen = Vec::new();
         for name in &args.modules {
@@ -86,13 +89,13 @@ pub(crate) fn plan(args: &PlanArgs, color: bool) -> Result<(String, Outcome), St
         }
         chosen
     };
-    if upgrading.is_empty() {
+    if selected.is_empty() {
         return Err("no Odoo module in the --addons folders".to_string());
     }
 
     eprintln!(
         "pontix: checking {} module(s) for Odoo {} -> {}",
-        upgrading.len(),
+        selected.len(),
         args.from.series(),
         args.to.series()
     );
@@ -105,9 +108,18 @@ pub(crate) fn plan(args: &PlanArgs, color: bool) -> Result<(String, Outcome), St
     };
     let source = pontix_index::scan(&paths(&args.core_from), args.from);
     let target = pontix_index::scan(&paths(&args.core_to), args.to);
-    let scan = pontix_scan::scan(&source, &target, &upgrading, &[]);
-    let report = pontix_scan::report(&scan);
-    let notices = notices(&source, &upgrading, args.from);
+    let scan = pontix_scan::scan(&source, &target, &found, &[]);
+    let mut report = pontix_scan::report(&scan);
+    // The report is about the chosen modules and the core they install.
+    let needed = dependencies(&source, &selected);
+    report.findings.retain(|finding| {
+        if found.contains(&finding.module) {
+            selected.contains(&finding.module)
+        } else {
+            needed.contains(&finding.module)
+        }
+    });
+    let notices = notices(&source, &selected, args.from);
 
     let roots = Roots {
         addons: &args.addons,
@@ -117,8 +129,8 @@ pub(crate) fn plan(args: &PlanArgs, color: bool) -> Result<(String, Outcome), St
         to: args.to,
     };
     let rendered = match args.format {
-        Format::Text => output::text(&report, &upgrading, &notices, &roots, color),
-        Format::Json => output::json(&report, &upgrading, &notices, &roots),
+        Format::Text => output::text(&report, &selected, &notices, &roots, color),
+        Format::Json => output::json(&report, &selected, &notices, &roots),
     };
     let failed = args.fail_on.is_some_and(|level| {
         let worst = match level {
@@ -131,6 +143,26 @@ pub(crate) fn plan(args: &PlanArgs, color: bool) -> Result<(String, Outcome), St
             .any(|finding| finding.severity <= worst)
     });
     Ok((rendered, Outcome { failed }))
+}
+
+/// The modules `selected` need, through `depends`, themselves included.
+fn dependencies(addons: &pontix_index::Addons, selected: &[ModuleName]) -> Vec<ModuleName> {
+    let mut needed: Vec<ModuleName> = Vec::new();
+    let mut pending: Vec<ModuleName> = selected.to_vec();
+    while let Some(name) = pending.pop() {
+        if needed.contains(&name) {
+            continue;
+        }
+        if let Some(module) = addons.modules.iter().find(|module| module.name == name) {
+            pending.extend(module.manifest.depends.iter().cloned());
+        }
+        // Odoo 19 treats an empty `depends` as `base`; `base` is always in.
+        needed.push(name);
+    }
+    if !needed.iter().any(|name| name.as_str() == "base") {
+        needed.push(ModuleName::new("base"));
+    }
+    needed
 }
 
 /// The tree must hold the Odoo version the flag says, as its

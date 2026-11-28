@@ -125,6 +125,13 @@ fn classify(issue: &Issue, target: &str) -> Classified {
                 "Manifest version {written} is not a {target} version: Odoo skips the module without an error."
             ),
         ),
+        Problem::StaleMigration { version } => plain(
+            PtxCode::M003,
+            issue.module.to_string(),
+            format!(
+                "migrations/{version} is for a version below {target}: its scripts never run again."
+            ),
+        ),
         Problem::ModelNameChanges { class, from, to } => plain(
             PtxCode::M004,
             class.clone(),

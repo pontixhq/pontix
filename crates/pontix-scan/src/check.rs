@@ -430,6 +430,11 @@ impl Checker<'_, '_, '_, '_> {
     /// A field path, followed from the class's model.
     fn path(&mut self, model: &ModelName, path: &str, how: PathUse, at: &Location) {
         let (source, target) = (&self.versions.source, &self.versions.target);
+        // A model that is gone is reported where it is used; its fields would
+        // only repeat that.
+        if !target.defined.contains(model) {
+            return;
+        }
         let Walk::Missing { model: on, field } = walk(&target.models, model, path) else {
             return;
         };

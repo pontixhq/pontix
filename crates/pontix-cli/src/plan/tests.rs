@@ -41,6 +41,12 @@ impl Trees {
             "{'name': 'Mine', 'version': '18.0.1.0.0', 'depends': ['base']}",
         );
         trees.write("custom/my_partner/__init__.py", "from . import models\n");
+        for folder in ["18.0.1.0.0", "0.0.0", "1.0.2"] {
+            trees.write(
+                &format!("custom/my_partner/migrations/{folder}/post-migration.py"),
+                "def migrate(cr, version):\n    pass\n",
+            );
+        }
         trees.write(
             "custom/my_partner/models.py",
             "class Partner(models.Model):\n    _inherit = 'res.partner'\n    fax_copy = fields.Char(related='fax')\n",
@@ -88,6 +94,13 @@ fn reports_findings_as_text_with_relative_paths() {
         "{text}"
     );
     assert!(text.contains("PTX-M002"), "{text}");
+    // 0.0.0 runs on every update, 1.0.2 is read as 19.0.1.0.2: only the
+    // 18.0 folder is stale.
+    assert!(
+        text.contains("PTX-M003  migrations/18.0.1.0.0 is for a version below 19.0"),
+        "{text}"
+    );
+    assert_eq!(text.matches("PTX-M003").count(), 1, "{text}");
     assert!(text.contains("Not checked: js, xpath"), "{text}");
     let root = trees.dir.path().to_string_lossy().into_owned();
     assert!(!text.contains(&root), "absolute paths leak into the report");
@@ -118,6 +131,28 @@ fn reports_findings_as_json_with_a_schema_version() {
     assert!(field["basis"]["after"].is_null());
     let root = trees.dir.path().to_string_lossy().into_owned();
     assert!(!json.contains(&root), "absolute paths leak into the report");
+}
+
+#[test]
+fn modules_of_the_same_folders_upgrade_together() {
+    let trees = Trees::new();
+    trees.write(
+        "custom/my_base/__manifest__.py",
+        "{'name': 'Base mixin', 'version': '18.0.1.0.0', 'depends': ['base']}",
+    );
+    trees.write("custom/my_base/__init__.py", "");
+    trees.write(
+        "custom/my_partner/__manifest__.py",
+        "{'name': 'Mine', 'version': '18.0.1.0.0', 'depends': ['base', 'my_base']}",
+    );
+    let args = PlanArgs {
+        modules: vec!["my_partner".to_string()],
+        ..trees.args()
+    };
+    let (text, _) = plan(&args, false).expect("a report");
+    assert!(!text.contains("PTX-M001"), "{text}");
+    assert!(!text.contains("\nmy_base\n"), "{text}");
+    assert!(text.contains("1 module(s) checked"), "{text}");
 }
 
 #[test]

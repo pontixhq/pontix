@@ -1,9 +1,11 @@
 //! What the modules being upgraded need from their own manifest and files to
 //! load at all in the target version.
 
+use std::fs;
 use std::num::NonZeroU32;
+use std::path::Path;
 
-use pontix_core::{DiagnosticKind, Location, ModuleName};
+use pontix_core::{DiagnosticKind, Location, ModuleName, OdooVersion};
 use pontix_index::Addons;
 
 use crate::{Evidence, Issue, Problem, Since};
@@ -14,6 +16,10 @@ const VERSION_RULE: &str = "odoo/modules/module.py, adapt_version and the instal
 
 /// The manifest file names Odoo reads.
 const MANIFEST_RULE: &str = "odoo/modules/module.py, MANIFEST_NAMES";
+
+/// Odoo runs a module's migration scripts only for versions above the one
+/// installed, up to the one being installed.
+const MIGRATION_RULE: &str = "odoo/modules/migration.py, MigrationManager";
 
 /// Odoo reads a manifest with `ast.literal_eval`.
 const LITERAL_RULE: &str = "odoo/modules/module.py, load_manifest (ast.literal_eval)";
@@ -38,6 +44,14 @@ pub(crate) fn check(source: &Addons, target: &Addons, upgrading: &[ModuleName]) 
                 MANIFEST_RULE,
             ));
             continue;
+        }
+        for version in stale_migrations(&module.path, target.version) {
+            let at = Location::new(
+                module.path.join("migrations").join(&version),
+                NonZeroU32::MIN,
+            );
+            let problem = Problem::StaleMigration { version };
+            issues.push(issue(&module.name, &at, problem, MIGRATION_RULE));
         }
         let written = module.manifest.version.as_deref().unwrap_or("1.0");
         let fits = target
@@ -79,6 +93,28 @@ pub(crate) fn check(source: &Addons, target: &Addons, upgrading: &[ModuleName]) 
         issues.push(found);
     }
     issues
+}
+
+/// Folders under `migrations/` whose version is not of the target series.
+/// `0.0.0` runs on every update and is never stale. Only folder names are
+/// read, sorted.
+fn stale_migrations(module: &Path, version: OdooVersion) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(module.join("migrations")) else {
+        return Vec::new();
+    };
+    let mut stale: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| name != "0.0.0")
+        .filter(|name| {
+            !version
+                .adapt_module_version(name)
+                .is_some_and(|adapted| version.is_own_series(&adapted))
+        })
+        .collect();
+    stale.sort();
+    stale
 }
 
 fn issue(module: &ModuleName, at: &Location, problem: Problem, rule: &'static str) -> Issue {

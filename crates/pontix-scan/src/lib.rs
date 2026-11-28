@@ -210,6 +210,12 @@ pub enum Problem {
         /// The version as written.
         written: String,
     },
+    /// A `migrations/` folder is for a version below the target series: its
+    /// scripts never run again, neither on upgrade nor on a new install.
+    StaleMigration {
+        /// The folder name: the version it migrates to.
+        version: String,
+    },
     /// The module's manifest is `__openerp__.py`, which the target version
     /// no longer reads: the module disappears.
     ManifestFileIgnored,

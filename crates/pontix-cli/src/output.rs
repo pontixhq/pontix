@@ -163,6 +163,7 @@ pub(crate) fn text(
         Category::DataLoss,
         Category::DataRisk,
         Category::Behavior,
+        Category::Housekeeping,
     ];
     let by_category: Vec<String> = categories
         .iter()
