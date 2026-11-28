@@ -29,6 +29,7 @@ fn field(
         field_type,
         comodel: comodel.map(ModelName::new),
         attrs: FieldAttrs::default(),
+        params: Vec::new(),
         location: at(file, line),
     }
 }
@@ -1370,4 +1371,187 @@ fn xpaths_and_locators_that_find_nothing_in_the_target_view_are_errors() {
         finding.message,
         "XPath //field[@name='date_order'] finds nothing in view sale.view_order_form as 19.0 has it."
     );
+}
+
+#[test]
+fn a_method_only_another_module_defines_is_not_there_for_this_one() {
+    // In 19.0 `sale_hook` defines `_old_hook` again, but only `other`, also
+    // being upgraded, installs it: for custom_sale the method is gone.
+    let with_hook = |mut addons: Addons, defines: bool| {
+        let methods = if defines {
+            vec![method("sale_hook/models.py", "_old_hook", &[], 7, 3)]
+        } else {
+            vec![]
+        };
+        addons.modules.push(module(
+            "sale_hook",
+            &["sale"],
+            None,
+            vec![model(
+                "sale_hook/models.py",
+                "sale.order",
+                extends("sale.order"),
+                vec![],
+                methods,
+            )],
+        ));
+        addons
+            .modules
+            .push(module("other", &["sale_hook"], Some("18.0.1.0.0"), vec![]));
+        addons
+    };
+    let upgrading = [ModuleName::new("custom_sale"), ModuleName::new("other")];
+    let scan = scan(
+        &with_hook(source(), false),
+        &with_hook(target(), true),
+        &upgrading,
+        &[],
+    );
+    assert!(
+        scan.issues
+            .iter()
+            .any(|issue| issue.module.as_str() == "custom_sale"
+                && matches!(
+                    &issue.problem,
+                    Problem::OverriddenMethodGone { method, .. } if method == "_old_hook"
+                )),
+        "{:?}",
+        scan.issues
+    );
+}
+
+#[test]
+fn field_parameters_the_target_field_class_no_longer_knows_are_warnings() {
+    use pontix_core::PtxCode;
+
+    let core = |relational: &str| {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let write = |relative: &str, content: &str| {
+            let path = dir.path().join(relative);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("directories");
+            std::fs::write(path, content).expect("a file");
+        };
+        write("odoo/__init__.py", "");
+        write(
+            "odoo/fields.py",
+            &format!("class Field:\n    string = None\n{relational}"),
+        );
+        dir
+    };
+    let (from, to) = (
+        core("class Many2one(Field):\n    auto_join = False\n"),
+        core("class Many2one(Field):\n    bypass_search_access = False\n"),
+    );
+    let (mut source, mut target) = (source(), target());
+    source.framework = pontix_index::framework(from.path());
+    target.framework = pontix_index::framework(to.path());
+    let declared = FieldDef {
+        params: vec![
+            ("auto_join".to_string(), at("custom_sale/models.py", 70)),
+            ("string".to_string(), at("custom_sale/models.py", 70)),
+            ("tracking".to_string(), at("custom_sale/models.py", 71)),
+        ],
+        ..field(
+            "custom_sale/models.py",
+            "reviewer_id",
+            FieldType::Many2one,
+            Some("res.partner"),
+            70,
+        )
+    };
+    for addons in [&mut source, &mut target] {
+        let custom = addons
+            .modules
+            .iter_mut()
+            .find(|module| module.name.as_str() == "custom_sale")
+            .expect("the custom module");
+        custom.models[0].fields.push(declared.clone());
+    }
+    let scan = scan(&source, &target, &[ModuleName::new("custom_sale")], &[]);
+    let gone: Vec<&Problem> = scan
+        .issues
+        .iter()
+        .filter(|issue| matches!(issue.problem, Problem::FieldParameterGone { .. }))
+        .map(|issue| &issue.problem)
+        .collect();
+    // `string` is still known; `tracking` was never a field class's.
+    assert_eq!(
+        gone,
+        [&Problem::FieldParameterGone {
+            model: name("sale.order"),
+            field: FieldName::new("reviewer_id"),
+            field_type: "Many2one".to_string(),
+            parameter: "auto_join".to_string(),
+        }]
+    );
+    let finding = report(&scan)
+        .findings
+        .into_iter()
+        .find(|finding| finding.code == PtxCode::F206)
+        .expect("an F206 finding");
+    assert_eq!(finding.severity, Severity::Warning);
+    assert_eq!(finding.locations[0].line.get(), 70);
+}
+
+#[test]
+fn data_files_that_need_demo_records_are_warnings() {
+    use pontix_core::PtxCode;
+
+    const DEMO: &str = "sale/data/sale_demo.xml";
+    const DATA: &str = "custom_sale/data/data.xml";
+    const MINE: &str = "custom_sale/demo/demo.xml";
+    let record = |file: &str, id: &str, line| pontix_core::Record {
+        id: Some(id.to_string()),
+        model: name("sale.order"),
+        fields: Vec::new(),
+        view: None,
+        location: at(file, line),
+    };
+    let (mut source, mut target) = (source(), target());
+    for addons in [&mut source, &mut target] {
+        let sale = &mut addons.modules[1];
+        sale.manifest.demo = vec!["data/sale_demo.xml".to_string()];
+        sale.data = vec![data(DEMO, vec![record(DEMO, "order_demo", 2)], vec![])];
+        let custom = addons
+            .modules
+            .iter_mut()
+            .find(|module| module.name.as_str() == "custom_sale")
+            .expect("the custom module");
+        custom.manifest.demo = vec!["demo/demo.xml".to_string()];
+        custom.data = vec![
+            data(
+                DATA,
+                vec![],
+                vec![reference(DATA, "sale.order_demo", RefKind::Ref, 4)],
+            ),
+            data(
+                MINE,
+                vec![],
+                vec![reference(MINE, "sale.order_demo", RefKind::Ref, 5)],
+            ),
+        ];
+    }
+    let scan = scan(&source, &target, &[ModuleName::new("custom_sale")], &[]);
+    let found: Vec<(&str, &Problem)> = scan
+        .issues
+        .iter()
+        .filter(|issue| matches!(issue.problem, Problem::DemoRecordInData { .. }))
+        .map(|issue| (issue.at.file.to_str().unwrap_or_default(), &issue.problem))
+        .collect();
+    // The demo file may rely on demo data.
+    assert_eq!(
+        found,
+        [(
+            DATA,
+            &Problem::DemoRecordInData {
+                xmlid: "sale.order_demo".to_string()
+            }
+        )]
+    );
+    let finding = report(&scan)
+        .findings
+        .into_iter()
+        .find(|finding| finding.code == PtxCode::R602)
+        .expect("an R602 finding");
+    assert_eq!(finding.severity, Severity::Warning);
 }

@@ -146,6 +146,10 @@ pub struct FieldDef {
     pub comodel: Option<ModelName>,
     /// The arguments that decide how it is stored.
     pub attrs: FieldAttrs,
+    /// The keyword arguments it is declared with, by name, each where it
+    /// is written: Odoo ignores, with a warning, those its field class does
+    /// not know.
+    pub params: Vec<(String, Location)>,
     /// Where the field is declared.
     pub location: Location,
 }
@@ -291,6 +295,7 @@ mod tests {
             field_type: FieldType::Char,
             comodel: None,
             attrs: FieldAttrs::default(),
+            params: Vec::new(),
             location: Location::new("models/test.py", line(at_line)),
         }
     }

@@ -158,6 +158,18 @@ pub enum Problem {
         /// Where the field probably went: model and field.
         renamed: Option<Renamed<(ModelName, FieldName)>>,
     },
+    /// A field is declared with a parameter its field class no longer
+    /// knows, such as `auto_join` on a `Many2one` in 19.0.
+    FieldParameterGone {
+        /// The model.
+        model: ModelName,
+        /// The field.
+        field: FieldName,
+        /// Its type, as written after `fields.`.
+        field_type: String,
+        /// The parameter.
+        parameter: String,
+    },
     /// A core field the module declares again is gone from core: the module's
     /// declaration now makes a field of its own, without core's behavior.
     RedeclaredFieldGone {
@@ -229,6 +241,13 @@ pub enum Problem {
     /// A test uses a record only demo data creates, and the target makes
     /// databases without demo data unless told otherwise.
     DemoRecord {
+        /// The external id, as `module.xmlid`.
+        xmlid: String,
+    },
+    /// A data file Odoo loads without demo data too refers to a record
+    /// only demo data creates, and the target makes databases without demo
+    /// data unless told otherwise: installing there fails.
+    DemoRecordInData {
         /// The external id, as `module.xmlid`.
         xmlid: String,
     },

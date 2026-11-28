@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 
 use pontix_core::resolve::{model_kind, model_name};
 use pontix_core::{
@@ -11,7 +12,7 @@ use pontix_core::{
 };
 use pontix_index::registry::{self, MethodView, ModelView, Xmlid, qualified};
 use pontix_index::views::{self, Located, Views};
-use pontix_index::{Framework, Installation, Module};
+use pontix_index::{Framework, Installation, Lookup, Module};
 
 use crate::path::{Scope, Walk, lookup, walk};
 
@@ -143,6 +144,7 @@ pub(crate) fn check(versions: &Versions<'_, '_, '_>) -> Vec<Issue> {
             module: &module.name,
             scope,
             issues: &mut issues,
+            in_data_file: false,
         };
         for def in &module.models {
             checker.class(def);
@@ -236,6 +238,9 @@ struct Checker<'c, 's, 'i, 'a> {
     /// What the module can rely on in the source and in the target version.
     scope: (Scope<'c>, Scope<'c>),
     issues: &'c mut Vec<Issue>,
+    /// Whether the references looked at are those of a data file Odoo
+    /// loads into every database, with demo data or without.
+    in_data_file: bool,
 }
 
 impl Checker<'_, '_, '_, '_> {
@@ -308,6 +313,7 @@ impl Checker<'_, '_, '_, '_> {
                 );
             }
             self.redeclared(&name, field);
+            self.field_parameters(&name, field);
         }
         for method in &def.methods {
             for paths in &method.field_paths {
@@ -329,7 +335,13 @@ impl Checker<'_, '_, '_, '_> {
 
     /// The module's data files and its `env.ref` calls.
     fn data(&mut self, module: &Module) {
-        for (_, file) in &module.data {
+        let demo: Vec<PathBuf> = module
+            .manifest
+            .demo
+            .iter()
+            .map(|file| module.path.join(file))
+            .collect();
+        for (path, file) in &module.data {
             for (model, at) in &file.models {
                 self.model(model, ModelUse::Record, at);
             }
@@ -349,9 +361,11 @@ impl Checker<'_, '_, '_, '_> {
                     self.view_targets(&id, view);
                 }
             }
+            self.in_data_file = !demo.contains(path);
             for reference in &file.refs {
                 self.xmlid(reference);
             }
+            self.in_data_file = false;
         }
         for reference in &module.xmlid_refs {
             self.xmlid(reference);
@@ -550,8 +564,9 @@ impl Checker<'_, '_, '_, '_> {
         );
     }
 
-    /// A record a test uses that only demo data creates, when the target
-    /// makes databases without demo data by default.
+    /// A record that only demo data creates, used by a test or by a data
+    /// file Odoo loads without demo data too, when the target makes
+    /// databases without demo data by default.
     fn demo_record(
         &mut self,
         reference: &XmlRef,
@@ -560,12 +575,19 @@ impl Checker<'_, '_, '_, '_> {
         evidence: Evidence,
     ) {
         let changes = self.versions.changes;
-        if reference.kind != RefKind::Test || !record.demo || changes.target.demo_by_default() {
+        if !record.demo || changes.target.demo_by_default() {
             return;
         }
+        let problem = if reference.kind == RefKind::Test {
+            Problem::DemoRecord { xmlid }
+        } else if self.in_data_file {
+            Problem::DemoRecordInData { xmlid }
+        } else {
+            return;
+        };
         self.push(
             &reference.location,
-            Problem::DemoRecord { xmlid },
+            problem,
             since(changes.source.demo_by_default()),
             evidence,
         );
@@ -734,17 +756,53 @@ impl Checker<'_, '_, '_, '_> {
         }
     }
 
+    /// The parameters a field is declared with that its field class knew
+    /// in the source version and no longer knows in the target one.
+    fn field_parameters(&mut self, model: &ModelName, field: &FieldDef) {
+        let (source, target) = (
+            self.versions.source.framework,
+            self.versions.target.framework,
+        );
+        let field_type = field.field_type.as_str();
+        for (parameter, at) in &field.params {
+            let Lookup::Found(before) = source.field_parameter(field_type, parameter) else {
+                continue;
+            };
+            if target.field_parameter(field_type, parameter) != Lookup::Missing {
+                continue;
+            }
+            self.push(
+                at,
+                Problem::FieldParameterGone {
+                    model: model.clone(),
+                    field: field.name.clone(),
+                    field_type: field_type.to_string(),
+                    parameter: parameter.clone(),
+                },
+                Since::Upgrade,
+                Evidence {
+                    before: Some(before.location.clone()),
+                    after: None,
+                    rule: None,
+                },
+            );
+        }
+    }
+
     /// A method the class defines that core defines on the model, or on a
     /// model it inherits from.
     fn overridden(&mut self, model: &ModelName, method: &MethodDef) {
         let (source, target) = (&self.versions.source, &self.versions.target);
-        let Some(before) = find_method(&source.core, model, &method.name) else {
+        let (from, to) = self.scope;
+        let Some((before, first_before)) = find_method_in(&source.core, model, &method.name, from)
+        else {
             return;
         };
-        if !target.core.contains_key(model) {
+        if !target.core.contains_key(model) || !target.defines(model, to) {
             return;
         }
-        let Some(after) = find_method(&target.core, model, &method.name) else {
+        let Some((after, first_after)) = find_method_in(&target.core, model, &method.name, to)
+        else {
             self.push(
                 &method.location,
                 Problem::OverriddenMethodGone {
@@ -754,7 +812,7 @@ impl Checker<'_, '_, '_, '_> {
                 },
                 Since::Upgrade,
                 Evidence {
-                    before: Some(before.first.location.clone()),
+                    before: Some(first_before.location.clone()),
                     after: None,
                     rule: None,
                 },
@@ -762,24 +820,24 @@ impl Checker<'_, '_, '_, '_> {
             return;
         };
         let evidence = Evidence {
-            before: Some(before.first.location.clone()),
-            after: Some(after.first.location.clone()),
+            before: Some(first_before.location.clone()),
+            after: Some(first_after.location.clone()),
             rule: None,
         };
-        if before.first.params != after.first.params {
+        if first_before.params != first_after.params {
             self.push(
                 &method.location,
                 Problem::OverriddenMethodParams {
                     model: model.clone(),
                     method: method.name.clone(),
-                    from: before.first.params.clone(),
-                    to: after.first.params.clone(),
+                    from: first_before.params.clone(),
+                    to: first_after.params.clone(),
                 },
                 Since::Upgrade,
                 evidence.clone(),
             );
         }
-        if fingerprints(before) != fingerprints(after) {
+        if fingerprints(before, from) != fingerprints(after, to) {
             self.push(
                 &method.location,
                 Problem::OverriddenMethodBody {
@@ -824,13 +882,15 @@ fn since(worked_before: bool) -> Since {
     }
 }
 
-/// The method as the model has it: its own, or that of the nearest model it
-/// inherits from.
-fn find_method<'v, 'a>(
+/// The method as the modules in scope have it, with its first definition
+/// among them: on the model, or on the nearest model it inherits from that
+/// a module in scope defines it on.
+pub(super) fn find_method_in<'v, 'a>(
     models: &'v BTreeMap<ModelName, ModelView<'a>>,
     model: &ModelName,
     method: &str,
-) -> Option<&'v MethodView<'a>> {
+    scope: Scope<'_>,
+) -> Option<(&'v MethodView<'a>, &'a MethodDef)> {
     let mut seen = BTreeSet::new();
     let mut pending = vec![model.clone()];
     while let Some(name) = pending.pop() {
@@ -840,19 +900,22 @@ fn find_method<'v, 'a>(
         let Some(view) = models.get(&name) else {
             continue;
         };
-        if let Some(found) = view.methods.get(method) {
-            return Some(found);
+        if let Some(found) = view.methods.get(method)
+            && let Some(first) = found.first_in(|module| scope.has(module))
+        {
+            return Some((found, first));
         }
         pending.extend(view.parents.iter().rev().cloned());
     }
     None
 }
 
-/// What each module's definition of the method does.
-fn fingerprints<'a>(method: &MethodView<'a>) -> BTreeMap<&'a ModuleName, u64> {
+/// What each module in scope makes the method do.
+fn fingerprints<'a>(method: &MethodView<'a>, scope: Scope<'_>) -> BTreeMap<&'a ModuleName, u64> {
     method
         .by_module
         .iter()
+        .filter(|(module, _)| scope.has(module))
         .map(|(module, def)| (*module, def.fingerprint))
         .collect()
 }

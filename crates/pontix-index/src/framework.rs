@@ -8,12 +8,12 @@
 //! at run time or a module-level `__getattr__`, the answer is
 //! [`Lookup::Unknown`], never [`Lookup::Missing`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use pontix_core::Location;
-use pontix_parsers::{BindingKind, FrameworkFile, parse_framework};
+use pontix_parsers::{BindingKind, FrameworkClass, FrameworkFile, parse_framework};
 
 use crate::files::Root;
 
@@ -31,6 +31,9 @@ pub struct Framework {
     modules: BTreeMap<String, Package>,
     /// Members of `BaseModel`: every model has them.
     base_model: BTreeMap<String, Api>,
+    /// The field classes by name: `Field` and its subclasses, in
+    /// `odoo.fields`, or in `odoo.orm.fields*` since 19.0.
+    fields: BTreeMap<String, FrameworkClass>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +96,50 @@ impl Framework {
     /// A method or attribute every model inherits from `BaseModel`.
     pub fn base_model(&self, name: &str) -> Option<&Api> {
         self.base_model.get(name)
+    }
+
+    /// Whether the field class of a type (`Many2one`) knows a parameter:
+    /// an attribute or method of it or of a field class it derives from,
+    /// which is what Odoo's `hasattr` test on the field asks, or a named
+    /// parameter of one's `__init__`, which takes it in. Any other
+    /// parameter Odoo ignores with a warning. Unknown for a type the
+    /// framework does not define, or a base it cannot follow.
+    pub fn field_parameter(&self, field_type: &str, name: &str) -> Lookup {
+        if self.fields.is_empty() {
+            return Lookup::Unknown;
+        }
+        let mut pending = vec![field_type];
+        let mut seen = BTreeSet::new();
+        while let Some(class) = pending.pop() {
+            if !seen.insert(class) {
+                continue;
+            }
+            let Some(found) = self.fields.get(class) else {
+                // Typing helpers add nothing a field knows.
+                if matches!(class, "Generic" | "object") {
+                    continue;
+                }
+                return Lookup::Unknown;
+            };
+            let init = found
+                .members
+                .iter()
+                .find(|member| member.name == "__init__");
+            let member = found
+                .members
+                .iter()
+                .find(|member| member.name == name)
+                .or(init.filter(|_| found.init_params.iter().any(|param| param == name)));
+            if let Some(member) = member {
+                return Lookup::Found(Api {
+                    location: member.location.clone(),
+                    deprecated: member.deprecated.clone(),
+                    module: false,
+                });
+            }
+            pending.extend(found.bases.iter().map(String::as_str));
+        }
+        Lookup::Missing
     }
 
     fn name(&self, module: &str, name: &str, hops: usize) -> Lookup {
@@ -168,6 +215,14 @@ pub fn framework(core: &Path) -> Framework {
     };
     let mut out = Framework::default();
     read_dir(&root, &odoo, "odoo", 0, &mut out);
+    let fields: BTreeMap<String, FrameworkClass> = out
+        .modules
+        .iter()
+        .filter(|(dotted, _)| *dotted == "odoo.fields" || dotted.starts_with("odoo.orm.fields"))
+        .flat_map(|(_, package)| &package.file.classes)
+        .map(|class| (class.name.clone(), class.clone()))
+        .collect();
+    out.fields = fields;
     let base_model = out
         .modules
         .values()
@@ -333,5 +388,52 @@ mod tests {
     fn no_framework_source_gives_an_empty_framework() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         assert!(framework(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn field_parameters_follow_the_field_classes() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let root = dir.path();
+        write(root, "odoo/__init__.py", "");
+        write(root, "odoo/orm/__init__.py", "");
+        write(
+            root,
+            "odoo/orm/fields.py",
+            "import typing\nclass MetaField(type): pass\nclass Field(MetaField('Dummy', (object,), {}), typing.Generic[T]):\n    string: str = None\n    def __init__(self, string=None, **kwargs): pass\n",
+        );
+        write(
+            root,
+            "odoo/orm/fields_relational.py",
+            "from .fields import Field\nclass _Relational(Field[M]):\n    bypass_search_access = False\nclass Many2one(_Relational):\n    def __init__(self, comodel_name=None, *, ondelete=None, **kwargs): pass\nclass Odd(Unknown):\n    pass\n",
+        );
+        let found = framework(root);
+        let known = |field_type: &str, name: &str| match found.field_parameter(field_type, name) {
+            Lookup::Found(_) => "found",
+            Lookup::Missing => "missing",
+            Lookup::Unknown => "unknown",
+        };
+        assert_eq!(known("Many2one", "bypass_search_access"), "found");
+        assert_eq!(known("Many2one", "string"), "found");
+        assert_eq!(
+            known("Many2one", "ondelete"),
+            "found",
+            "an __init__ parameter"
+        );
+        assert_eq!(known("Many2one", "auto_join"), "missing");
+        assert_eq!(known("Many2one", "kwargs"), "missing");
+        assert_eq!(
+            known("Odd", "anything"),
+            "unknown",
+            "a base it cannot follow"
+        );
+        assert_eq!(
+            known("Custom", "string"),
+            "unknown",
+            "a type it does not define"
+        );
+        assert_eq!(
+            Framework::default().field_parameter("Char", "size"),
+            Lookup::Unknown
+        );
     }
 }

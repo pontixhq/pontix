@@ -2,6 +2,7 @@
 
 use pontix_core::{FieldAttrs, FieldType, ModelName, Written};
 use ruff_python_ast::{Expr, ExprCall};
+use ruff_text_size::TextSize;
 
 /// What the value of a class attribute declares, as far as fields go.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +15,8 @@ pub(super) enum Field {
         comodel: Comodel,
         /// The arguments that decide how it is stored.
         attrs: FieldAttrs,
+        /// The names of its keyword arguments, each with where it starts.
+        params: Vec<(String, TextSize)>,
     },
     /// Written with the name of a core field type but not as `fields.X(...)`,
     /// for example `Char(...)`, `f.Char(...)` or `fields.Char` without a call.
@@ -49,10 +52,20 @@ pub(super) fn field(value: &Expr, model_name: Option<&ModelName>) -> Option<Fiel
                     Comodel::Absent
                 };
                 let attrs = attrs(call, &field_type);
+                let params = call
+                    .arguments
+                    .keywords
+                    .iter()
+                    .filter_map(|keyword| {
+                        let name = keyword.arg.as_ref()?;
+                        Some((name.as_str().to_string(), keyword.range.start()))
+                    })
+                    .collect();
                 Some(Field::Declared {
                     field_type,
                     comodel,
                     attrs,
+                    params,
                 })
             }
             func if names_core_field_type(func) => Some(Field::Unrecognized),
@@ -193,9 +206,41 @@ mod tests {
     use super::*;
     use ruff_python_parser::parse_expression;
 
+    /// The declaration, without the names of its arguments.
     fn read(source: &str) -> Option<Field> {
         let parsed = parse_expression(source).expect("test source must be a valid expression");
-        field(&parsed.syntax().body, None)
+        without_params(field(&parsed.syntax().body, None))
+    }
+
+    fn without_params(found: Option<Field>) -> Option<Field> {
+        found.map(|found| match found {
+            Field::Declared {
+                field_type,
+                comodel,
+                attrs,
+                ..
+            } => Field::Declared {
+                field_type,
+                comodel,
+                attrs,
+                params: Vec::new(),
+            },
+            other => other,
+        })
+    }
+
+    #[test]
+    fn keyword_arguments_are_kept_by_name_and_position() {
+        let source = "fields.Many2one('res.partner', auto_join=True, **extra, string='Partner')";
+        let parsed = parse_expression(source).expect("a valid expression");
+        let Some(Field::Declared { params, .. }) = field(&parsed.syntax().body, None) else {
+            panic!("a field");
+        };
+        let names: Vec<(&str, u32)> = params
+            .iter()
+            .map(|(name, at)| (name.as_str(), at.to_u32()))
+            .collect();
+        assert_eq!(names, [("auto_join", 31), ("string", 56)]);
     }
 
     fn declared(field_type: FieldType, comodel: Comodel) -> Option<Field> {
@@ -207,6 +252,7 @@ mod tests {
             field_type,
             comodel,
             attrs,
+            params: Vec::new(),
         })
     }
 
@@ -291,7 +337,7 @@ mod tests {
             ..FieldAttrs::default()
         };
         assert_eq!(
-            field(&parsed.syntax().body, Some(&category)),
+            without_params(field(&parsed.syntax().body, Some(&category))),
             with_attrs(
                 FieldType::Many2one,
                 Comodel::Named(category.clone()),
@@ -299,7 +345,7 @@ mod tests {
             )
         );
         assert_eq!(
-            field(&parsed.syntax().body, None),
+            without_params(field(&parsed.syntax().body, None)),
             with_attrs(FieldType::Many2one, Comodel::Unreadable, computed())
         );
     }

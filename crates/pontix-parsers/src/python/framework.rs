@@ -72,8 +72,15 @@ pub enum BindingKind {
 pub struct FrameworkClass {
     /// The class name.
     pub name: String,
+    /// The names of its bases as last written: `fields.Field` and
+    /// `Field[int]` give `Field`. A base made by a call, such as a
+    /// metaclass's dummy class, is left out.
+    pub bases: Vec<String>,
     /// Its methods and attributes, in source order.
     pub members: Vec<Member>,
+    /// The parameters its own `__init__` takes by name, without `*args`
+    /// and `**kwargs`.
+    pub init_params: Vec<String>,
 }
 
 /// A method or attribute of a framework class.
@@ -129,7 +136,25 @@ impl Reader<'_> {
                     let (members, deprecated) = self.class(class);
                     out.classes.push(FrameworkClass {
                         name: class.name.as_str().to_string(),
+                        bases: class
+                            .arguments
+                            .as_deref()
+                            .map(|arguments| arguments.args.iter().filter_map(base_name).collect())
+                            .unwrap_or_default(),
                         members,
+                        init_params: class
+                            .body
+                            .iter()
+                            .find_map(|stmt| match stmt {
+                                Stmt::FunctionDef(def) if def.name.as_str() == "__init__" => {
+                                    Some(super::method::params(def))
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|param| !param.starts_with('*'))
+                            .collect(),
                     });
                     self.def(class.name.as_str(), deprecated, stmt, out);
                 }
@@ -367,6 +392,17 @@ fn names(target: &Expr) -> Vec<String> {
         Expr::Tuple(tuple) => tuple.elts.iter().flat_map(names).collect(),
         Expr::List(list) => list.elts.iter().flat_map(names).collect(),
         _ => Vec::new(),
+    }
+}
+
+/// The name a class base is written with: `Field`, `fields.Field` or
+/// `Field[int]`.
+fn base_name(base: &Expr) -> Option<String> {
+    match base {
+        Expr::Name(name) => Some(name.id.as_str().to_string()),
+        Expr::Attribute(attribute) => Some(attribute.attr.as_str().to_string()),
+        Expr::Subscript(subscript) => base_name(&subscript.value),
+        _ => None,
     }
 }
 

@@ -10,7 +10,7 @@ use pontix_core::{CodeRef, CodeRoot, CodeUse, Location, ModelName};
 use pontix_index::registry::{Xmlid, qualified};
 use pontix_index::{Lookup, Module};
 
-use super::{Checker, find_method};
+use super::{Checker, find_method_in};
 use crate::path::{Walk, lookup, reach, walk};
 use crate::{ApiUse, Evidence, ModelUse, PathUse, Problem, Since};
 
@@ -131,14 +131,17 @@ impl Checker<'_, '_, '_, '_> {
     /// existed before, on the model or on every model through `BaseModel`.
     fn method_call(&mut self, model: &ModelName, method: &str, how: ApiUse, at: &Location) {
         let (source, target) = (&self.versions.source, &self.versions.target);
-        let (Some(before), Some(after)) = (source.models.get(model), target.models.get(model))
-        else {
-            return;
-        };
-        if after.has_method(method) || target.framework.is_empty() {
+        let (from, to) = self.scope;
+        // A model gone for this module is reported where it is used.
+        if !source.defines(model, from) || !target.defines(model, to) {
             return;
         }
-        let own = find_method(&source.models, model, method);
+        if find_method_in(&target.models, model, method, to).is_some()
+            || target.framework.is_empty()
+        {
+            return;
+        }
+        let own = find_method_in(&source.models, model, method, from).map(|(found, _)| found);
         // A method only the modules being upgraded define is theirs.
         if own.is_some_and(|found| {
             found
@@ -149,7 +152,7 @@ impl Checker<'_, '_, '_, '_> {
             return;
         }
         let base_before = source.framework.base_model(method);
-        let defined_before = before.has_method(method) && own.is_some();
+        let defined_before = own.is_some();
         if !defined_before && base_before.is_none() {
             return;
         }

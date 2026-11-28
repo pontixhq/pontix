@@ -348,6 +348,7 @@ impl Reader<'_> {
             field_type,
             comodel,
             attrs,
+            params,
         } = declaration
         else {
             self.report(DiagnosticKind::UnrecognizedField, stmt.range());
@@ -367,6 +368,10 @@ impl Reader<'_> {
             field_type,
             comodel,
             attrs,
+            params: params
+                .into_iter()
+                .map(|(name, start)| (name, self.source.location(start)))
+                .collect(),
             location: self.source.location(target.range.start()),
         });
     }

@@ -46,6 +46,9 @@ pub enum PtxCode {
     F203,
     /// A core field the module declares again is gone from core.
     F205,
+    /// A field is declared with a parameter its field class no longer
+    /// knows: Odoo ignores it, with a warning in the log.
+    F206,
     /// A core method the module overrides with `super()` is gone.
     P401,
     /// A core method the module overrides takes other parameters.
@@ -60,6 +63,10 @@ pub enum PtxCode {
     A102,
     /// A record the module refers to by external id is gone.
     R601,
+    /// A data file Odoo loads without demo data too refers to a record only
+    /// demo data creates, and the target makes databases without demo data
+    /// by default.
+    R602,
     /// An inheriting view's XPath finds nothing in the view it inherits.
     X301,
     /// A test relies on a record only demo data creates, and the target
@@ -91,6 +98,7 @@ impl PtxCode {
             Self::F202 => "PTX-F202",
             Self::F203 => "PTX-F203",
             Self::F205 => "PTX-F205",
+            Self::F206 => "PTX-F206",
             Self::P401 => "PTX-P401",
             Self::P402 => "PTX-P402",
             Self::P403 => "PTX-P403",
@@ -98,6 +106,7 @@ impl PtxCode {
             Self::A101 => "PTX-A101",
             Self::A102 => "PTX-A102",
             Self::R601 => "PTX-R601",
+            Self::R602 => "PTX-R602",
             Self::X301 => "PTX-X301",
             Self::T802 => "PTX-T802",
             Self::D901 => "PTX-D901",
@@ -111,11 +120,13 @@ impl PtxCode {
         match self {
             Self::M003
             | Self::F205
+            | Self::F206
             | Self::P402
             | Self::P403
             | Self::P404
             | Self::A102
             | Self::T802
+            | Self::R602
             | Self::D902
             | Self::D903 => Severity::Warning,
             _ => Severity::Error,
@@ -127,7 +138,7 @@ impl PtxCode {
         match self {
             Self::D901 => Category::DataLoss,
             Self::D902 | Self::D903 => Category::DataRisk,
-            Self::F205 | Self::P402 | Self::P403 | Self::P404 => Category::Behavior,
+            Self::F205 | Self::F206 | Self::P402 | Self::P403 | Self::P404 => Category::Behavior,
             Self::M003 => Category::Housekeeping,
             _ => Category::CodeBreak,
         }

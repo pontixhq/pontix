@@ -325,12 +325,31 @@ fn classify(issue: &Issue, target: &str) -> Classified {
                 ),
             )
         },
+        Problem::FieldParameterGone {
+            model,
+            field,
+            field_type,
+            parameter,
+        } => plain(
+            PtxCode::F206,
+            format!("{model}.{field}.{parameter}"),
+            format!(
+                "Field {model}.{field} is declared with {parameter}=, which {field_type} fields no longer take in {target}: Odoo ignores it, with a warning."
+            ),
+        ),
         Problem::ViewTargetGone { view, spec, xpath } => plain(
             PtxCode::X301,
             format!("{view} {spec}"),
             format!(
                 "{} {spec} finds nothing in view {view} as {target} has it.",
                 if *xpath { "XPath" } else { "Locator" }
+            ),
+        ),
+        Problem::DemoRecordInData { xmlid } => plain(
+            PtxCode::R602,
+            xmlid.clone(),
+            format!(
+                "Data file refers to record {xmlid}, which only demo data creates: installing on a {target} database without demo data fails."
             ),
         ),
         // One finding per module: the fix is one choice for all its tests.

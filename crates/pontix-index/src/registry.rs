@@ -120,6 +120,19 @@ pub struct MethodView<'a> {
     /// Each module's definition; a module that defines it twice keeps the
     /// later one, as Python does.
     pub by_module: BTreeMap<&'a ModuleName, &'a MethodDef>,
+    /// The modules defining it, in load order.
+    pub order: Vec<&'a ModuleName>,
+}
+
+impl<'a> MethodView<'a> {
+    /// The first definition in load order among the modules `keep` keeps:
+    /// the method's signature as those modules see it.
+    pub fn first_in(&self, keep: impl Fn(&ModuleName) -> bool) -> Option<&'a MethodDef> {
+        self.order
+            .iter()
+            .find(|module| keep(module))
+            .and_then(|module| self.by_module.get(module).copied())
+    }
 }
 
 /// Every model of the installation, built from its class definitions in
@@ -189,8 +202,15 @@ pub fn models<'a>(installation: &Installation<'a>) -> BTreeMap<ModelName, ModelV
                     .or_insert(MethodView {
                         first: method,
                         by_module: BTreeMap::new(),
+                        order: Vec::new(),
                     });
-                entry.by_module.insert(&definition.module.name, method);
+                if entry
+                    .by_module
+                    .insert(&definition.module.name, method)
+                    .is_none()
+                {
+                    entry.order.push(&definition.module.name);
+                }
             }
         }
         views.insert(name, view);

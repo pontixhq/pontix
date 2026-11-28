@@ -325,6 +325,7 @@ mod tests {
             field_type,
             comodel: comodel.map(ModelName::new),
             attrs: FieldAttrs::default(),
+            params: Vec::new(),
             location: at("models.py", line),
         }
     }
