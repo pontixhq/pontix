@@ -14,6 +14,10 @@ pub struct Element {
     pub attributes: Vec<(String, String)>,
     /// The child elements, in document order.
     pub children: Vec<Element>,
+    /// The text before its first child, when there is more than whitespace:
+    /// the value an inheriting view's `<attribute>` gives, or the `$0` that
+    /// stands for the element a `replace` replaces.
+    pub text: Option<String>,
     /// Where the element is.
     pub location: Location,
 }
@@ -55,6 +59,7 @@ mod tests {
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
             children,
+            text: None,
             location: Location::new(PathBuf::from("views.xml"), NonZeroU32::MIN),
         }
     }

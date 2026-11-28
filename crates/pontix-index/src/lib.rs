@@ -18,8 +18,10 @@ mod install;
 mod load;
 pub mod registry;
 mod scan;
+pub mod views;
 
 pub use files::MAX_FILE_SIZE;
 pub use framework::{Api, Framework, Lookup, framework};
 pub use install::{InstallOptions, Installation, ModelRef, install, install_with};
 pub use scan::{Addons, Module, ScanOptions, scan, scan_with};
+pub use views::{Located, Views, locate, specs};

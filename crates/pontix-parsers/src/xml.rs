@@ -126,21 +126,29 @@ impl Reader<'_> {
                 "record" => self.record(child, depth + 1),
                 "template" => {
                     let id = child.attribute("id").map(str::to_string);
-                    // Odoo stores a template as `<t t-name="...">` around
-                    // its content.
+                    let inherit_id = child.attribute("inherit_id");
+                    // As Odoo's `_tag_template` stores it: `<t t-name>`
+                    // around the content, or `<data>` around the specs of
+                    // an inheriting template.
                     let mut arch = self.element(child, depth + 1);
-                    arch.tag = "t".to_string();
-                    arch.attributes = id
-                        .iter()
-                        .map(|id| ("t-name".to_string(), id.clone()))
-                        .collect();
+                    arch.text = None;
+                    if inherit_id.is_some() {
+                        arch.tag = "data".to_string();
+                        arch.attributes.clear();
+                    } else {
+                        arch.tag = "t".to_string();
+                        arch.attributes = id
+                            .iter()
+                            .map(|id| ("t-name".to_string(), id.clone()))
+                            .collect();
+                    }
                     self.out.data.records.push(Record {
                         id,
                         model: ModelName::new("ir.ui.view"),
                         fields: Vec::new(),
                         view: Some(View {
                             model: None,
-                            inherit_id: child.attribute("inherit_id").map(str::to_string),
+                            inherit_id: inherit_id.map(str::to_string),
                             fields: Vec::new(),
                             arch: Some(arch),
                             primary: child
@@ -226,10 +234,7 @@ impl Reader<'_> {
                 "inherit_id" => view.inherit_id = field.attribute("ref").map(str::to_string),
                 "arch" => {
                     view.fields = self.arch(field, depth + 1);
-                    view.arch = field
-                        .children()
-                        .find(Node::is_element)
-                        .map(|root| self.element(root, depth + 2));
+                    view.arch = self.arch_root(field, depth + 1);
                 }
                 "mode" => view.primary = field.text().is_some_and(|mode| mode.trim() == "primary"),
                 "priority" => {
@@ -246,6 +251,24 @@ impl Reader<'_> {
             view,
             location: self.location(node),
         });
+    }
+
+    /// The root of an architecture. Several elements in `<field
+    /// name="arch">` are wrapped in `<data>`, as Odoo's
+    /// `_fix_multiple_roots` does.
+    fn arch_root(&self, field: Node<'_, '_>, depth: usize) -> Option<Element> {
+        let roots: Vec<Node<'_, '_>> = field.children().filter(Node::is_element).collect();
+        match roots.as_slice() {
+            [] => None,
+            [root] => Some(self.element(*root, depth + 1)),
+            _ => {
+                let mut data = self.element(field, depth);
+                data.tag = "data".to_string();
+                data.attributes.clear();
+                data.text = None;
+                Some(data)
+            }
+        }
     }
 
     /// An element and the elements inside it, down to the deepest level
@@ -266,6 +289,10 @@ impl Reader<'_> {
                 .map(|attribute| (attribute.name().to_string(), attribute.value().to_string()))
                 .collect(),
             children,
+            text: node
+                .text()
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_string),
             location: self.location(node),
         }
     }
@@ -580,6 +607,13 @@ mod tests {
             "  <template id='report_mine' inherit_id='sale.report' primary='True' priority='5'>",
             "    <xpath expr='//div' position='inside'><span t-field='doc.name'/></xpath>",
             "  </template>",
+            "  <template id='report_base'><div class='page'>Hello</div></template>",
+            "  <record id='two_specs' model='ir.ui.view'>",
+            "    <field name='arch' type='xml'>",
+            "      <field name='a' position='after'/>",
+            "      <field name='b' position='after'/>",
+            "    </field>",
+            "  </record>",
             "</odoo>",
         ]);
         let views: Vec<&View> = file
@@ -597,12 +631,23 @@ mod tests {
         let template = views[1];
         assert!(template.primary);
         assert_eq!(template.priority, Some(5));
-        let arch = template.arch.as_ref().expect("the template's content");
+        let arch = template.arch.as_ref().expect("the template's specs");
+        assert_eq!((arch.tag.as_str(), arch.attributes.len()), ("data", 0));
+        assert_eq!(arch.at(&[0, 0]).map(|span| span.tag.as_str()), Some("span"));
+        let arch = views[2].arch.as_ref().expect("the template's content");
         assert_eq!(
             (arch.tag.as_str(), arch.attribute("t-name")),
-            ("t", Some("report_mine"))
+            ("t", Some("report_base"))
         );
-        assert_eq!(arch.at(&[0, 0]).map(|span| span.tag.as_str()), Some("span"));
+        assert_eq!(arch.children[0].text.as_deref(), Some("Hello"));
+        let arch = views[3].arch.as_ref().expect("both specs");
+        assert_eq!(arch.tag, "data");
+        let names: Vec<_> = arch
+            .children
+            .iter()
+            .map(|spec| spec.attribute("name"))
+            .collect();
+        assert_eq!(names, [Some("a"), Some("b")]);
     }
 
     #[test]

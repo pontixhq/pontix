@@ -18,4 +18,5 @@ pontix-diff = { path = "../pontix-diff" }
 pontix-index = { path = "../pontix-index" }
 
 [dev-dependencies]
+pontix-parsers = { path = "../pontix-parsers" }
 tempfile = "3"

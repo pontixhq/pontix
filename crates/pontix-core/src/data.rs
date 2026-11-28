@@ -49,8 +49,10 @@ pub struct View {
     /// The `<field>` elements of its architecture. A QWeb `<template>` has
     /// none: its fields are expressions, which Pontix does not read.
     pub fields: Vec<ArchField>,
-    /// The architecture: the root element of `<field name="arch">`, or for
-    /// a `<template>` a `<t t-name>` holding its content, as Odoo stores it.
+    /// The architecture, as Odoo stores it: the root element of `<field
+    /// name="arch">` (several are wrapped in `<data>`), or for a
+    /// `<template>` its content in `<t t-name>`, or its specs in `<data>`
+    /// when it inherits.
     pub arch: Option<Element>,
     /// `mode` is `primary`: an inheriting view that makes a view of its own
     /// rather than extending the one it inherits.

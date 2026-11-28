@@ -957,6 +957,7 @@ mod tests {
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
             children,
+            text: None,
             location: Location::new("views.xml", NonZeroU32::MIN),
         }
     }

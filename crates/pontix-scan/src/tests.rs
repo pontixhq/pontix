@@ -1271,3 +1271,72 @@ fn tests_that_need_gone_or_demo_records_are_warnings() {
         ]
     );
 }
+
+#[test]
+fn xpaths_that_find_nothing_in_the_target_view_are_errors() {
+    use pontix_core::PtxCode;
+
+    let xml = |file: &str, body: &str| {
+        let parsed = pontix_parsers::parse_xml(file.as_ref(), &format!("<odoo>{body}</odoo>"));
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        (PathBuf::from(file), parsed.data)
+    };
+    let form = |fields: &str| {
+        format!(
+            "<record id='view_order_form' model='ir.ui.view'><field name='model'>sale.order</field><field name='arch' type='xml'><form><group>{fields}</group></form></field></record>"
+        )
+    };
+    let (mut source, mut target) = (source(), target());
+    source.modules[1].data = vec![xml(
+        "sale/views.xml",
+        &form("<field name='partner_id'/><field name='date_order'/>"),
+    )];
+    target.modules[1].data = vec![xml("sale/views.xml", &form("<field name='partner_id'/>"))];
+    let mine = xml(
+        "custom_sale/views.xml",
+        "<record id='view_order_form' model='ir.ui.view'><field name='inherit_id' ref='sale.view_order_form'/><field name='arch' type='xml'>\
+         <xpath expr=\"//field[@name='date_order']\" position='after'><field name='x'/></xpath>\
+         <xpath expr=\"//field[@name='partner_id']\" position='after'><field name='y'/></xpath>\
+         <xpath expr=\"//field[@name='y']\" position='after'/>\
+         <xpath expr=\"//label[text()='Customer']\" position='after'/>\
+         <xpath expr=\"//field[@name='never_there']\" position='after'/>\
+         </field></record>",
+    );
+    for addons in [&mut source, &mut target] {
+        let custom = addons
+            .modules
+            .iter_mut()
+            .find(|module| module.name.as_str() == "custom_sale")
+            .expect("the custom module");
+        custom.data = vec![mine.clone()];
+    }
+    let scan = scan(&source, &target, &[ModuleName::new("custom_sale")], &[]);
+    let gone: Vec<(u32, &Problem)> = scan
+        .issues
+        .iter()
+        .filter(|issue| matches!(issue.problem, Problem::ViewTargetGone { .. }))
+        .map(|issue| (issue.at.line.get(), &issue.problem))
+        .collect();
+    // Only `date_order`: `y` comes from the view itself, `text()` is not
+    // read, and `never_there` never matched.
+    assert_eq!(
+        gone,
+        [(
+            1,
+            &Problem::ViewTargetGone {
+                view: "sale.view_order_form".to_string(),
+                spec: "//field[@name='date_order']".to_string(),
+            }
+        )]
+    );
+    let finding = report(&scan)
+        .findings
+        .into_iter()
+        .find(|finding| finding.code == PtxCode::X301)
+        .expect("an X301 finding");
+    assert_eq!(finding.severity, Severity::Error);
+    assert_eq!(
+        finding.message,
+        "XPath //field[@name='date_order'] finds nothing in view sale.view_order_form as 19.0 has it."
+    );
+}

@@ -10,6 +10,7 @@ use pontix_core::{
     ModelKind, ModelName, ModuleName, RefKind, Rename, View, Written, XmlRef,
 };
 use pontix_index::registry::{self, MethodView, ModelView, Xmlid, qualified};
+use pontix_index::views::{self, Located, Views};
 use pontix_index::{Framework, Installation, Module};
 
 use crate::path::{Scope, Walk, lookup, walk};
@@ -39,6 +40,8 @@ pub(crate) struct Side<'i, 'a> {
     xmlids: BTreeMap<String, Xmlid<'a>>,
     /// The framework, empty when it was not read.
     framework: &'a Framework,
+    /// Every view, the upgraded modules' included.
+    views: Views<'a>,
 }
 
 impl<'i, 'a> Side<'i, 'a> {
@@ -55,6 +58,7 @@ impl<'i, 'a> Side<'i, 'a> {
             definers: definers(full),
             xmlids: registry::xmlids(full),
             framework,
+            views: Views::new(full),
         }
     }
 }
@@ -331,14 +335,17 @@ impl Checker<'_, '_, '_, '_> {
             }
             for record in &file.records {
                 self.model(&record.model, ModelUse::Record, &record.location);
-                if !self.versions.target.defines(&record.model, self.scope.1) {
-                    continue;
-                }
                 let id = record
                     .id
                     .as_deref()
                     .map(|id| qualified(&module.name, id))
                     .unwrap_or_default();
+                if let Some(view) = &record.view {
+                    self.view_targets(&id, view);
+                }
+                if !self.versions.target.defines(&record.model, self.scope.1) {
+                    continue;
+                }
                 for (field, at) in &record.fields {
                     let how = PathUse::RecordValue(id.clone());
                     self.path(&record.model, field.as_str(), how, at);
@@ -366,6 +373,58 @@ impl Checker<'_, '_, '_, '_> {
         }
         for reference in &module.xmlid_refs {
             self.xmlid(reference);
+        }
+    }
+
+    /// The XPath specs of an inheriting view that find something in the
+    /// source version of the view it inherits and nothing in the target
+    /// one. Each spec looks at the architecture the ones before it made, in
+    /// the target version as far as they still apply. Whatever Pontix
+    /// cannot combine or read with certainty is left out.
+    fn view_targets(&mut self, id: &str, view: &View) {
+        let (source, target) = (&self.versions.source, &self.versions.target);
+        let (Some(own), Some(parent)) = (&view.arch, &view.inherit_id) else {
+            return;
+        };
+        let (from, to) = self.scope;
+        let in_source = |module: &ModuleName| from.has(module);
+        let in_target = |module: &ModuleName| to.has(module);
+        let Some(mut before) = source.views.before(id, &in_source) else {
+            return;
+        };
+        let Some(mut after) = target.views.before(id, &in_target) else {
+            return;
+        };
+        let parent = qualified(self.module, parent);
+        let Some(parent_view) = target.views.get(&parent) else {
+            return;
+        };
+        let parent_at = parent_view.location.clone();
+        for spec in views::specs(own) {
+            let Located::Found(found) = views::locate(&before, spec) else {
+                return;
+            };
+            let worked = before.at(&found).map(|element| element.location.clone());
+            if spec.tag == "xpath" && views::locate(&after, spec) == Located::Missing {
+                self.push(
+                    &spec.location,
+                    Problem::ViewTargetGone {
+                        view: parent.clone(),
+                        spec: spec.attribute("expr").unwrap_or_default().to_string(),
+                    },
+                    Since::Upgrade,
+                    Evidence {
+                        before: worked,
+                        after: Some(parent_at.clone()),
+                        rule: None,
+                    },
+                );
+            }
+            if !views::apply_spec(&mut before, spec) {
+                return;
+            }
+            // In the target, a spec that no longer applies is passed over.
+            views::apply_spec(&mut after, spec);
         }
     }
 

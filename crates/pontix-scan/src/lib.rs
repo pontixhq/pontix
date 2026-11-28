@@ -215,6 +215,14 @@ pub enum Problem {
         /// How the module refers to it.
         how: RefKind,
     },
+    /// An inheriting view's XPath finds nothing in the architecture of the
+    /// view it inherits, as the target version makes it.
+    ViewTargetGone {
+        /// The inherited view, as `module.xmlid`.
+        view: String,
+        /// The XPath, as written.
+        spec: String,
+    },
     /// A test uses a record only demo data creates, and the target makes
     /// databases without demo data unless told otherwise.
     DemoRecord {

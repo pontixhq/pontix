@@ -60,6 +60,8 @@ pub enum PtxCode {
     A102,
     /// A record the module refers to by external id is gone.
     R601,
+    /// An inheriting view's XPath finds nothing in the view it inherits.
+    X301,
     /// A test relies on a record only demo data creates, and the target
     /// makes databases without demo data by default.
     T802,
@@ -96,6 +98,7 @@ impl PtxCode {
             Self::A101 => "PTX-A101",
             Self::A102 => "PTX-A102",
             Self::R601 => "PTX-R601",
+            Self::X301 => "PTX-X301",
             Self::T802 => "PTX-T802",
             Self::D901 => "PTX-D901",
             Self::D902 => "PTX-D902",

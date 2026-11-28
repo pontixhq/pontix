@@ -14,7 +14,9 @@ use crate::{ApiUse, Issue, ModelUse, PathUse, Problem, Scan, Since};
 /// finding never reads as safe.
 pub const NOT_COVERED: &[&str] = &[
     "js",
-    "xpath",
+    // `<field>` and other elements that locate where an inheriting view
+    // applies: their target in the inherited view is not checked yet.
+    "view_locators",
     "view_expressions",
     "qweb",
     // Python code whose model Pontix cannot tell, such as a method
@@ -326,6 +328,11 @@ fn classify(issue: &Issue, target: &str) -> Classified {
                 ),
             )
         },
+        Problem::ViewTargetGone { view, spec } => plain(
+            PtxCode::X301,
+            format!("{view} {spec}"),
+            format!("XPath {spec} finds nothing in view {view} as {target} has it."),
+        ),
         // One finding per module: the fix is one choice for all its tests.
         // The message, naming the records, is written once they are known.
         Problem::DemoRecord { xmlid } => plain(
