@@ -43,6 +43,16 @@ pub(crate) struct PlanArgs {
     /// A folder of custom modules to check. Repeat it for several.
     #[arg(long, value_name = "DIR", required = true)]
     pub(crate) addons: Vec<PathBuf>,
+    /// A folder of third-party modules the custom ones depend on, such as an
+    /// OCA repository, in the version upgraded from. They are not upgraded.
+    /// Repeat it for several.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) deps: Vec<PathBuf>,
+    /// The same third-party modules in the version upgraded to. A module in
+    /// --deps that none of these folders has is gone from that version.
+    /// Without it, they are taken as unchanged.
+    #[arg(long = "deps-to", value_name = "DIR")]
+    pub(crate) deps_to: Vec<PathBuf>,
     /// Only these modules, comma separated. Default: every module in the
     /// addons folders.
     #[arg(long, value_name = "NAMES", value_delimiter = ',')]

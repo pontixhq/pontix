@@ -28,6 +28,8 @@ pub(crate) struct Notice {
 /// The folders paths are shown relative to.
 pub(crate) struct Roots<'a> {
     pub(crate) addons: &'a [PathBuf],
+    pub(crate) deps: &'a [PathBuf],
+    pub(crate) deps_to: &'a [PathBuf],
     pub(crate) core_from: &'a Path,
     pub(crate) core_to: &'a Path,
     pub(crate) from: OdooVersion,
@@ -39,6 +41,8 @@ pub(crate) struct Roots<'a> {
 #[serde(rename_all = "snake_case")]
 enum RootKind {
     Addons,
+    Deps,
+    DepsTo,
     CoreFrom,
     CoreTo,
     Other,
@@ -50,6 +54,16 @@ impl Roots<'_> {
             .addons
             .iter()
             .map(|root| (RootKind::Addons, root.as_path()))
+            .chain(
+                self.deps
+                    .iter()
+                    .map(|root| (RootKind::Deps, root.as_path())),
+            )
+            .chain(
+                self.deps_to
+                    .iter()
+                    .map(|root| (RootKind::DepsTo, root.as_path())),
+            )
             .chain([
                 (RootKind::CoreFrom, self.core_from),
                 (RootKind::CoreTo, self.core_to),
@@ -69,8 +83,12 @@ impl Roots<'_> {
     fn text(&self, location: &Location) -> String {
         let (kind, path) = self.place(&location.file);
         match kind {
-            RootKind::CoreFrom => format!("[{}] {path}:{}", self.from.series(), location.line),
-            RootKind::CoreTo => format!("[{}] {path}:{}", self.to.series(), location.line),
+            RootKind::CoreFrom | RootKind::Deps => {
+                format!("[{}] {path}:{}", self.from.series(), location.line)
+            }
+            RootKind::CoreTo | RootKind::DepsTo => {
+                format!("[{}] {path}:{}", self.to.series(), location.line)
+            }
             RootKind::Addons | RootKind::Other => format!("{path}:{}", location.line),
         }
     }
@@ -128,6 +146,7 @@ impl Paint {
 pub(crate) fn text(
     report: &Report,
     upgrading: &[ModuleName],
+    deps: &[ModuleName],
     notices: &[Notice],
     roots: &Roots<'_>,
     color: bool,
@@ -178,10 +197,16 @@ pub(crate) fn text(
         })
         .collect();
     let _ = writeln!(out, "  {}", by_category.join(" · "));
+    // Third-party dependencies change data the same way core does.
+    let others = if deps.is_empty() {
+        "Core data"
+    } else {
+        "Core and dependency data"
+    };
     let [core_errors, core_warnings, _] = counts(core.iter().copied());
     let _ = writeln!(
         out,
-        "Core data: {core_errors} error(s) · {core_warnings} warning(s)"
+        "{others}: {core_errors} error(s) · {core_warnings} warning(s)"
     );
 
     for notice in notices {
@@ -200,7 +225,9 @@ pub(crate) fn text(
         let _ = writeln!(
             out,
             "\n{}",
-            paint.bold("Core data (every database with these core modules installed)")
+            paint.bold(&format!(
+                "{others} (every database with these modules installed)"
+            ))
         );
         for finding in &core {
             finding_text(&mut out, finding, roots, &paint);
@@ -338,6 +365,7 @@ struct JsonNotice<'r> {
 pub(crate) fn json(
     report: &Report,
     upgrading: &[ModuleName],
+    deps: &[ModuleName],
     notices: &[Notice],
     roots: &Roots<'_>,
 ) -> String {
@@ -371,6 +399,8 @@ pub(crate) fn json(
                 module: finding.module.as_str(),
                 scope: if in_custom(finding, upgrading) {
                     "custom"
+                } else if deps.contains(&finding.module) {
+                    "dependency"
                 } else {
                     "core"
                 },

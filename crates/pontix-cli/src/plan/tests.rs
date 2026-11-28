@@ -67,6 +67,8 @@ impl Trees {
             core_from: self.dir.path().join("core18"),
             core_to: self.dir.path().join("core19"),
             addons: vec![self.dir.path().join("custom")],
+            deps: Vec::new(),
+            deps_to: Vec::new(),
             modules: Vec::new(),
             format: Format::Text,
             output: None,
@@ -190,9 +192,88 @@ fn refuses_input_it_cannot_work_with() {
     };
     assert!(error(not_odoo).contains("is not an Odoo source tree"));
 
+    let deps_to_alone = PlanArgs {
+        deps_to: vec![trees.dir.path().join("custom")],
+        ..trees.args()
+    };
+    assert!(error(deps_to_alone).contains("--deps-to needs --deps"));
+
     let unknown = PlanArgs {
         modules: vec!["ghost".to_string()],
         ..trees.args()
     };
     assert!(error(unknown).contains("module ghost is not in the --addons folders"));
+}
+
+#[test]
+fn third_party_dependencies_are_checked_in_their_target_version() {
+    let trees = Trees::new();
+    for (version, field) in [("18", "    oca_code = fields.Char()\n"), ("19", "")] {
+        let dep = format!("oca{version}/oca_partner");
+        trees.write(
+            &format!("{dep}/__manifest__.py"),
+            &format!("{{'name': 'OCA', 'version': '{version}.0.1.0.0', 'depends': ['base']}}"),
+        );
+        trees.write(&format!("{dep}/__init__.py"), "from . import models\n");
+        trees.write(
+            &format!("{dep}/models.py"),
+            &format!("class Partner(models.Model):\n    _inherit = 'res.partner'\n{field}"),
+        );
+    }
+    // Renamed in the target version: only the source has it.
+    trees.write(
+        "oca18/oca_old/__manifest__.py",
+        "{'name': 'Old', 'version': '18.0.1.0.0', 'depends': ['base']}",
+    );
+    trees.write("oca18/oca_old/__init__.py", "");
+    trees.write(
+        "custom/my_partner/__manifest__.py",
+        "{'name': 'Mine', 'version': '18.0.1.0.0', 'depends': ['oca_partner', 'oca_old']}",
+    );
+    trees.write(
+        "custom/my_partner/models.py",
+        "class Partner(models.Model):\n    _inherit = 'res.partner'\n    code_copy = fields.Char(related='oca_code')\n",
+    );
+    let args = PlanArgs {
+        deps: vec![trees.dir.path().join("oca18")],
+        deps_to: vec![trees.dir.path().join("oca19")],
+        format: Format::Json,
+        ..trees.args()
+    };
+    let (json, _) = plan(&args, false).expect("a report");
+    let document: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    let findings = document["findings"].as_array().expect("findings");
+    let find = |code: &str, subject: &str| {
+        findings
+            .iter()
+            .find(|finding| finding["code"] == code && finding["subject"] == subject)
+            .unwrap_or_else(|| panic!("{code} {subject} in {json}"))
+    };
+    let field = find("PTX-F201", "res.partner.oca_code");
+    assert_eq!(field["scope"], "custom");
+    assert_eq!(field["basis"]["before"]["root"], "deps");
+    assert_eq!(field["basis"]["before"]["path"], "oca_partner/models.py");
+    assert_eq!(find("PTX-M001", "oca_old")["module"], "my_partner");
+    // The dependencies are not upgraded: nothing is said about their own
+    // manifests.
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding["module"] == "oca_partner" && finding["code"] == "PTX-M002"),
+        "{json}"
+    );
+    assert!(
+        document["modules"]
+            .as_array()
+            .is_none_or(|modules| modules.len() == 1)
+    );
+
+    // Without --deps-to the dependencies are taken as unchanged.
+    let unchanged = PlanArgs {
+        deps_to: Vec::new(),
+        ..args
+    };
+    let (json, _) = plan(&unchanged, false).expect("a report");
+    assert!(!json.contains("res.partner.oca_code"), "{json}");
+    assert!(!json.contains("\"oca_old\""), "{json}");
 }

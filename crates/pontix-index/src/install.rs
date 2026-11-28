@@ -64,7 +64,7 @@ impl<'a> Installation<'a> {
 
 /// How to install, beyond which modules: the countries of the companies,
 /// which decide country-specific `auto_install` modules, and the modules
-/// being upgraded.
+/// being upgraded or left out.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InstallOptions<'o> {
     /// Country codes of the companies, as in `res.country.code`.
@@ -74,6 +74,10 @@ pub struct InstallOptions<'o> {
     /// another series and although a dependency cannot be installed. That
     /// dependency is still reported on the module.
     pub upgrading: &'o [ModuleName],
+    /// Modules never installed, not even by `auto_install`, so that neither
+    /// they nor what depends on them is: core, without the custom modules
+    /// that third-party `auto_install` bridges would pull in.
+    pub left_out: &'o [ModuleName],
 }
 
 /// Installs `requested` the way Odoo would, on the modules `addons` found,
@@ -90,7 +94,7 @@ pub fn install<'a>(
         requested,
         &InstallOptions {
             company_countries,
-            upgrading: &[],
+            ..InstallOptions::default()
         },
     )
 }
@@ -106,7 +110,11 @@ pub fn install_with<'a>(
         company_countries: options.company_countries,
         upgrading: options.upgrading,
         by_name: addons.modules.iter().map(|m| (m.name.clone(), m)).collect(),
-        state: HashMap::new(),
+        state: options
+            .left_out
+            .iter()
+            .map(|name| (name.clone(), State::Failed))
+            .collect(),
         installed: Vec::new(),
         diagnostics: Vec::new(),
     };
@@ -404,6 +412,23 @@ mod tests {
     }
 
     #[test]
+    fn modules_left_out_are_never_installed() {
+        let mut modules = core(OdooVersion::V19).modules;
+        modules.push(module("needs_custom", &["custom"], AutoInstall::No));
+        let addons = addons(OdooVersion::V19, modules);
+        let left_out = names(&["sale_stock", "custom"]);
+        let installation = install_with(
+            &addons,
+            &names(&["sale", "stock", "needs_custom"]),
+            &InstallOptions {
+                left_out: &left_out,
+                ..InstallOptions::default()
+            },
+        );
+        assert_eq!(order(&installation), ["base", "sale", "stock"]);
+    }
+
+    #[test]
     fn auto_install_triggers_can_be_a_subset_or_empty() {
         let mut modules = core(OdooVersion::V19).modules;
         modules.push(module(
@@ -477,8 +502,8 @@ mod tests {
             &addons,
             &requested,
             &InstallOptions {
-                company_countries: &[],
                 upgrading: &requested,
+                ..InstallOptions::default()
             },
         );
         assert_eq!(order(&upgrading), ["base", "sale", "custom_sale"]);

@@ -68,10 +68,20 @@ pub(crate) fn plan(args: &PlanArgs, color: bool) -> Result<(String, Outcome), St
     }
     check_core(&args.core_from, args.from, "--core-from")?;
     check_core(&args.core_to, args.to, "--core-to")?;
-    for dir in &args.addons {
-        if !dir.is_dir() {
-            return Err(format!("--addons {} is not a folder", dir.display()));
+    let folders = [
+        ("--addons", &args.addons),
+        ("--deps", &args.deps),
+        ("--deps-to", &args.deps_to),
+    ];
+    for (flag, dirs) in folders {
+        if let Some(dir) = dirs.iter().find(|dir| !dir.is_dir()) {
+            return Err(format!("{flag} {} is not a folder", dir.display()));
         }
+    }
+    if args.deps.is_empty() && !args.deps_to.is_empty() {
+        return Err(
+            "--deps-to needs --deps: the same modules in the version upgraded from".to_string(),
+        );
     }
     // Every module of the addons folders is upgraded with the others, so a
     // dependency between them is not reported as missing. `--modules` only
@@ -100,27 +110,65 @@ pub(crate) fn plan(args: &PlanArgs, color: bool) -> Result<(String, Outcome), St
         args.from.series(),
         args.to.series()
     );
-    let paths = |core: &Path| -> Vec<PathBuf> {
+    if !args.deps.is_empty() && args.deps_to.is_empty() {
+        eprintln!(
+            "pontix: no --deps-to: the --deps modules are taken as unchanged in {}",
+            args.to.series()
+        );
+    }
+    // The custom modules come first, as in Odoo's addons path, so a
+    // dependency of the same name does not hide one.
+    let deps_to = if args.deps_to.is_empty() {
+        &args.deps
+    } else {
+        &args.deps_to
+    };
+    let paths = |core: &Path, deps: &[PathBuf]| -> Vec<PathBuf> {
         [core.join("odoo").join("addons"), core.join("addons")]
             .into_iter()
             .filter(|path| path.is_dir())
             .chain(args.addons.iter().cloned())
+            .chain(deps.iter().cloned())
             .collect()
     };
     // Only the custom modules are checked, so only their code is read.
     let options = ScanOptions {
         read_code_in: &args.addons,
     };
-    let mut source = scan_with(&paths(&args.core_from), args.from, options);
-    let mut target = scan_with(&paths(&args.core_to), args.to, options);
+    let mut source = scan_with(&paths(&args.core_from, &args.deps), args.from, options);
+    let mut target = scan_with(&paths(&args.core_to, deps_to), args.to, options);
     source.framework = framework(&args.core_from);
     target.framework = framework(&args.core_to);
-    let scan = pontix_scan::scan(&source, &target, &found, &[]);
+    let in_deps: Vec<ModuleName> = custom_modules(&args.deps, args.from)
+        .into_iter()
+        .filter(|name| !found.contains(name))
+        .collect();
+    // Without their target version, dependencies upgrade with the custom
+    // modules, unchanged and not reported on: the version they have now
+    // would not install in the target.
+    let mut upgraded = found.clone();
+    if args.deps_to.is_empty() {
+        upgraded.extend(in_deps.iter().cloned());
+    }
+    let third_party: &[ModuleName] = if args.deps_to.is_empty() {
+        &[]
+    } else {
+        &in_deps
+    };
+    let scan = pontix_scan::scan_with(
+        &source,
+        &target,
+        &upgraded,
+        &pontix_scan::ScanOptions {
+            third_party,
+            ..pontix_scan::ScanOptions::default()
+        },
+    );
     let mut report = pontix_scan::report(&scan);
     // The report is about the chosen modules and the core they install.
     let needed = dependencies(&source, &selected);
     report.findings.retain(|finding| {
-        if found.contains(&finding.module) {
+        if upgraded.contains(&finding.module) {
             selected.contains(&finding.module)
         } else {
             needed.contains(&finding.module)
@@ -130,14 +178,16 @@ pub(crate) fn plan(args: &PlanArgs, color: bool) -> Result<(String, Outcome), St
 
     let roots = Roots {
         addons: &args.addons,
+        deps: &args.deps,
+        deps_to: &args.deps_to,
         core_from: &args.core_from,
         core_to: &args.core_to,
         from: args.from,
         to: args.to,
     };
     let rendered = match args.format {
-        Format::Text => output::text(&report, &selected, &notices, &roots, color),
-        Format::Json => output::json(&report, &selected, &notices, &roots),
+        Format::Text => output::text(&report, &selected, &in_deps, &notices, &roots, color),
+        Format::Json => output::json(&report, &selected, &in_deps, &notices, &roots),
     };
     let failed = args.fail_on.is_some_and(|level| {
         let worst = match level {
@@ -204,7 +254,7 @@ fn check_core(core: &Path, expected: OdooVersion, flag: &str) -> Result<(), Stri
     }
 }
 
-/// Every module directory in the addons folders: one with a manifest Odoo
+/// Every module directory in the folders: one with a manifest Odoo
 /// reads in `version`, readable or not, in folder order and then by name.
 fn custom_modules(addons: &[PathBuf], version: OdooVersion) -> Vec<ModuleName> {
     let mut found = Vec::new();

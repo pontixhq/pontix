@@ -29,7 +29,7 @@ use pontix_core::{
     ChangeSet, CodeUse, Confidence, DiagnosticKind, FieldName, FieldType, Location, ModelName,
     ModuleName, RefKind, Storage,
 };
-use pontix_index::{Addons, InstallOptions, install, install_with};
+use pontix_index::{Addons, InstallOptions, install_with};
 
 /// What the scan found, and the core changes it was checked against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,16 +326,48 @@ pub enum ApiUse {
 /// Checks `upgrading`, found in both `source` and `target`, for what the
 /// upgrade from `source` to `target` breaks. Both sets of addons hold core
 /// and the modules being upgraded; `company_countries` decides
-/// country-specific `auto_install` modules, as in [`install`].
+/// country-specific `auto_install` modules, as in [`pontix_index::install`].
 pub fn scan(
     source: &Addons,
     target: &Addons,
     upgrading: &[ModuleName],
     company_countries: &[String],
 ) -> Scan {
+    scan_with(
+        source,
+        target,
+        upgrading,
+        &ScanOptions {
+            company_countries,
+            ..ScanOptions::default()
+        },
+    )
+}
+
+/// What a scan needs beyond the addons and the modules being upgraded.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanOptions<'o> {
+    /// Country codes of the companies, as in [`InstallOptions`].
+    pub company_countries: &'o [String],
+    /// Third-party modules the upgraded ones depend on, such as OCA ones,
+    /// found in both sets of addons in their own version. They count as
+    /// core, but a field one of them still declares must not hide what core
+    /// itself renamed or dropped.
+    pub third_party: &'o [ModuleName],
+}
+
+/// [`scan`], with third-party dependencies.
+pub fn scan_with(
+    source: &Addons,
+    target: &Addons,
+    upgrading: &[ModuleName],
+    scan_options: &ScanOptions<'_>,
+) -> Scan {
+    let company_countries = scan_options.company_countries;
     let options = InstallOptions {
         company_countries,
         upgrading,
+        ..InstallOptions::default()
     };
     let full_source = install_with(source, upgrading, &options);
     let full_target = install_with(target, upgrading, &options);
@@ -346,9 +378,39 @@ pub fn scan(
         .map(|module| module.name.clone())
         .filter(|name| !upgrading.contains(name))
         .collect();
-    let core_source = install(source, &core, company_countries);
-    let core_target = install(target, &core, company_countries);
-    let changes = pontix_diff::diff(&core_source, &core_target);
+    // A third-party `auto_install` module can be one being upgraded: core
+    // never installs those, nor what needs them.
+    let core_options = InstallOptions {
+        company_countries,
+        left_out: upgrading,
+        ..InstallOptions::default()
+    };
+    let core_source = install_with(source, &core, &core_options);
+    let core_target = install_with(target, &core, &core_options);
+    let mut changes = pontix_diff::diff(&core_source, &core_target);
+    if !scan_options.third_party.is_empty() {
+        // Core alone, without the third-party modules and what needs them:
+        // its renames and removals come first.
+        let left_out: Vec<ModuleName> = upgrading
+            .iter()
+            .chain(scan_options.third_party)
+            .cloned()
+            .collect();
+        let core_options = InstallOptions {
+            left_out: &left_out,
+            ..core_options
+        };
+        let own: Vec<ModuleName> = core
+            .iter()
+            .filter(|name| !left_out.contains(name))
+            .cloned()
+            .collect();
+        let alone = pontix_diff::diff(
+            &install_with(source, &own, &core_options),
+            &install_with(target, &own, &core_options),
+        );
+        changes = merged(alone, changes);
+    }
 
     // Each module is checked against what it installs itself, not against
     // everything the modules being upgraded install together.
@@ -416,6 +478,22 @@ fn installs(
         .map(|installed| installed.name.clone())
         .collect();
     (modules, !incomplete)
+}
+
+/// The changes of core alone, then those the third-party modules add.
+fn merged(alone: ChangeSet, all: ChangeSet) -> ChangeSet {
+    let mut changes = alone;
+    for change in all.changes {
+        if !changes.changes.contains(&change) {
+            changes.changes.push(change);
+        }
+    }
+    for rename in all.renames {
+        if !changes.renames.contains(&rename) {
+            changes.renames.push(rename);
+        }
+    }
+    changes
 }
 
 #[cfg(test)]

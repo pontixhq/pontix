@@ -30,6 +30,11 @@ pontix plan --from 18.0 --to 19.0 \
   --core-from ~/odoo/18.0 --core-to ~/odoo/19.0 \
   --addons ~/client/custom
 
+# Third-party modules the custom ones depend on (OCA and others): give
+# them in both versions. They are not upgraded; a module only in --deps
+# is reported as gone from the target version.
+pontix plan ... --deps ~/oca/18.0/sale-workflow --deps-to ~/oca/19.0/sale-workflow
+
 # JSON for tools and AI agents
 pontix plan ... --format json --output plan.json
 
