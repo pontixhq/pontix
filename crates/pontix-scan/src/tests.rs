@@ -504,6 +504,7 @@ fn data(
             records,
             models: Vec::new(),
             refs,
+            xmlids: Vec::new(),
         },
     )
 }
@@ -1154,4 +1155,118 @@ fn a_field_only_another_module_declares_is_not_there_for_this_one() {
         .collect();
     assert_eq!(fax.len(), 1, "{fax:?}");
     assert_eq!(fax[0].0, "custom_sale");
+}
+
+#[test]
+fn tests_that_need_gone_or_demo_records_are_warnings() {
+    use pontix_core::PtxCode;
+
+    const DATA: &str = "sale/data/sale_data.xml";
+    const DEMO: &str = "sale/data/sale_demo.xml";
+    const MINE: &str = "custom_sale/demo/demo.xml";
+    const TEST: &str = "custom_sale/tests/test_sale.py";
+    let record = |file: &str, id: &str, line| pontix_core::Record {
+        id: Some(id.to_string()),
+        model: name("sale.order"),
+        fields: Vec::new(),
+        view: None,
+        location: at(file, line),
+    };
+    let sale = |module: &mut Module, gone: bool| {
+        module.manifest.demo = vec!["data/sale_demo.xml".to_string()];
+        let mut data_file = data(DATA, vec![], vec![]);
+        if gone {
+            data_file.1.records.push(record(DATA, "action_old", 3));
+        }
+        // A record that Python makes and `_update_xmlids` names, which demo
+        // data then updates: it is there without demo data.
+        data_file.1.xmlids = vec![("sale.warehouse_order".to_string(), at(DATA, 5))];
+        let demo = data(
+            DEMO,
+            vec![
+                record(DEMO, "order_demo", 2),
+                record(DEMO, "warehouse_order", 4),
+            ],
+            vec![],
+        );
+        module.data = vec![data_file, demo];
+    };
+    let (mut source, mut target) = (source(), target());
+    sale(&mut source.modules[1], true);
+    sale(&mut target.modules[1], false);
+    for addons in [&mut source, &mut target] {
+        let custom = addons
+            .modules
+            .iter_mut()
+            .find(|module| module.name.as_str() == "custom_sale")
+            .expect("the custom module");
+        custom.manifest.demo = vec!["demo/demo.xml".to_string()];
+        custom.data = vec![data(MINE, vec![record(MINE, "custom_demo", 2)], vec![])];
+        custom.xmlid_refs = [
+            ("sale.action_old", 10),
+            ("sale.order_demo", 11),
+            ("sale.warehouse_order", 12),
+            ("custom_demo", 13),
+            ("sale.never_seen", 14),
+            ("sale.order_demo", 15),
+        ]
+        .into_iter()
+        .map(|(xmlid, line)| reference(TEST, xmlid, RefKind::Test, line))
+        .collect();
+    }
+    let scan = scan(&source, &target, &[ModuleName::new("custom_sale")], &[]);
+    let found: Vec<(u32, &Problem)> = scan
+        .issues
+        .iter()
+        .filter(|issue| issue.at.file.ends_with("test_sale.py"))
+        .map(|issue| (issue.at.line.get(), &issue.problem))
+        .collect();
+    let demo = |xmlid: &str| Problem::DemoRecord {
+        xmlid: xmlid.to_string(),
+    };
+    assert_eq!(
+        found,
+        [
+            (
+                10,
+                &Problem::RecordGone {
+                    xmlid: "sale.action_old".to_string(),
+                    how: RefKind::Test,
+                }
+            ),
+            (11, &demo("sale.order_demo")),
+            (13, &demo("custom_sale.custom_demo")),
+            (15, &demo("sale.order_demo")),
+        ]
+    );
+    let findings: Vec<(PtxCode, Severity, String, usize)> = report(&scan)
+        .findings
+        .into_iter()
+        .filter(|finding| matches!(finding.code, PtxCode::R601 | PtxCode::T802))
+        .map(|finding| {
+            (
+                finding.code,
+                finding.severity,
+                finding.message,
+                finding.locations.len(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        findings,
+        [
+            (
+                PtxCode::R601,
+                Severity::Warning,
+                "Record sale.action_old does not exist in 19.0 (env.ref() in tests).".to_string(),
+                1
+            ),
+            (
+                PtxCode::T802,
+                Severity::Warning,
+                "Tests use 2 records (custom_sale.custom_demo, sale.order_demo) that only demo data creates: 19.0 makes databases without demo data unless run with --with-demo.".to_string(),
+                3
+            ),
+        ]
+    );
 }

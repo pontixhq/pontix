@@ -12,6 +12,8 @@ use pontix_core::{
     RefKind, View, XmlRef,
 };
 use roxmltree::{Document, Node, ParsingOptions};
+use ruff_python_ast::Expr;
+use ruff_python_parser::parse_expression;
 use ruff_text_size::TextSize;
 
 use crate::source::SourceFile;
@@ -141,8 +143,29 @@ impl Reader<'_> {
                         let location = self.location(child);
                         self.out.data.models.push((ModelName::new(model), location));
                     }
+                    if child.has_tag_name("function")
+                        && child.attribute("model") == Some("ir.model.data")
+                        && child.attribute("name") == Some("_update_xmlids")
+                    {
+                        self.update_xmlids(child);
+                    }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// `<function model="ir.model.data" name="_update_xmlids">`: each
+    /// `<value eval="[{'xml_id': ..., 'record': ...}]">` names external ids
+    /// for records made elsewhere, such as a warehouse's locations.
+    fn update_xmlids(&mut self, node: Node<'_, '_>) {
+        for value in node.children().filter(|child| child.has_tag_name("value")) {
+            let Some(eval) = value.attribute("eval") else {
+                continue;
+            };
+            let location = self.location(value);
+            for xmlid in eval_xmlids(eval) {
+                self.out.data.xmlids.push((xmlid, location.clone()));
             }
         }
     }
@@ -365,6 +388,37 @@ fn eval_refs(expr: &str) -> Vec<&str> {
     found
 }
 
+/// The literal `'xml_id'` values of the dictionaries in an `eval` list,
+/// as `_update_xmlids` takes them. Anything else, or Python that does not
+/// parse, yields nothing.
+fn eval_xmlids(expr: &str) -> Vec<String> {
+    let Ok(parsed) = parse_expression(expr.trim()) else {
+        return Vec::new();
+    };
+    let Expr::List(list) = &*parsed.syntax().body else {
+        return Vec::new();
+    };
+    list.elts
+        .iter()
+        .filter_map(|element| match element {
+            Expr::Dict(dict) => dict.items.iter().find_map(|item| {
+                let key = match &item.key {
+                    Some(Expr::StringLiteral(key)) => key.value.to_str(),
+                    _ => return None,
+                };
+                match &item.value {
+                    Expr::StringLiteral(value) if key == "xml_id" => {
+                        Some(value.value.to_str().trim().to_string())
+                    }
+                    _ => None,
+                }
+            }),
+            _ => None,
+        })
+        .filter(|xmlid| !xmlid.is_empty())
+        .collect()
+}
+
 /// The external ids of `%(...)d` and `%(...)s` in an attribute, as in a
 /// button's `name="%(sale.action_view_sale_advance_payment_inv)d"`.
 fn percent_refs(value: &str) -> Vec<&str> {
@@ -580,5 +634,38 @@ mod tests {
     fn other_root_elements_are_not_odoo_data() {
         let file = parse(&["<templates><t t-name='x'><field name='y'/></t></templates>"]);
         assert_eq!(file, XmlFile::default());
+    }
+
+    #[test]
+    fn update_xmlids_names_records_made_elsewhere() {
+        let file = parse(&[
+            "<odoo>",
+            "  <function model='ir.model.data' name='_update_xmlids'>",
+            "    <value model='base' eval=\"[{",
+            "        'xml_id': 'stock.stock_location_stock',",
+            "        'record': obj().env.ref('stock.warehouse0').lot_stock_id,",
+            "    }, {'record': obj(), 'xml_id': 'stock.picking_type_in'}, {'xml_id': name}]\"/>",
+            "  </function>",
+            "  <function model='ir.model.data' name='_update_xmlids'>",
+            "    <value eval='not python ['/>",
+            "  </function>",
+            "  <function model='res.partner' name='_update_xmlids'>",
+            "    <value eval=\"[{'xml_id': 'base.not_this'}]\"/>",
+            "  </function>",
+            "</odoo>",
+        ]);
+        let ids: Vec<(&str, u32)> = file
+            .data
+            .xmlids
+            .iter()
+            .map(|(xmlid, at)| (xmlid.as_str(), at.line.get()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("stock.stock_location_stock", 3),
+                ("stock.picking_type_in", 3)
+            ]
+        );
     }
 }

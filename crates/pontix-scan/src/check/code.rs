@@ -7,7 +7,7 @@
 //! Pontix cannot see, and is left alone.
 
 use pontix_core::{CodeRef, CodeRoot, CodeUse, Location, ModelName};
-use pontix_index::registry::qualified;
+use pontix_index::registry::{Xmlid, qualified};
 use pontix_index::{Lookup, Module};
 
 use super::{Checker, find_method};
@@ -59,8 +59,10 @@ impl Checker<'_, '_, '_, '_> {
             CodeRoot::Xmlid(xmlid) => {
                 let id = qualified(self.module, xmlid);
                 match self.versions.source.xmlids.get(&id) {
-                    Some(record) => record.model.clone(),
-                    None => return,
+                    Some(Xmlid {
+                        model: Some(model), ..
+                    }) => model.clone(),
+                    _ => return,
                 }
             }
         };

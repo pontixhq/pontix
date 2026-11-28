@@ -7,7 +7,7 @@ use std::num::NonZeroU32;
 use pontix_core::resolve::{model_kind, model_name};
 use pontix_core::{
     ApiDecorator, ChangeSet, DiagnosticKind, FieldDef, FieldName, Location, MethodDef, ModelDef,
-    ModelKind, ModelName, ModuleName, Rename, View, Written, XmlRef,
+    ModelKind, ModelName, ModuleName, RefKind, Rename, View, Written, XmlRef,
 };
 use pontix_index::registry::{self, MethodView, ModelView, Xmlid, qualified};
 use pontix_index::{Framework, Installation, Module};
@@ -403,21 +403,41 @@ impl Checker<'_, '_, '_, '_> {
         let Some((owner, local)) = id.split_once('.') else {
             return;
         };
-        // Records of the modules being upgraded, and those Odoo makes for
-        // modules and their categories, are not core's to break.
+        // Records Odoo makes for modules and their categories are not core's
+        // to break.
+        if local.starts_with("module_") {
+            return;
+        }
+        let (source, target) = (&self.versions.source, &self.versions.target);
+        // Records of the modules being upgraded are theirs to keep, but
+        // tests may still rely on the module's own demo data.
         if self
             .versions
             .upgrading
             .iter()
             .any(|module| module.as_str() == owner)
-            || local.starts_with("module_")
         {
+            if let Some(record) = source.xmlids.get(&id) {
+                let evidence = Evidence {
+                    before: Some(record.location.clone()),
+                    after: None,
+                    rule: None,
+                };
+                self.demo_record(reference, record, id, evidence);
+            }
             return;
         }
-        let (source, target) = (&self.versions.source, &self.versions.target);
         // A record is only there for a module that installs its owner.
         let owner = ModuleName::new(owner);
-        if target.xmlids.contains_key(&id) && self.scope.1.has(&owner) {
+        if let Some(record) = target.xmlids.get(&id)
+            && self.scope.1.has(&owner)
+        {
+            let evidence = Evidence {
+                before: None,
+                after: Some(record.location.clone()),
+                rule: None,
+            };
+            self.demo_record(reference, record, id, evidence);
             return;
         }
         let before = source
@@ -426,6 +446,11 @@ impl Checker<'_, '_, '_, '_> {
             .filter(|_| self.scope.0.has(&owner))
             .map(|found| found.location.clone());
         let existed = before.is_some();
+        // Tests refer to records Pontix cannot see, such as those of CSV
+        // files: only one that is gone with the upgrade is worth a word.
+        if !existed && reference.kind == RefKind::Test {
+            return;
+        }
         self.push(
             &reference.location,
             Problem::RecordGone {
@@ -438,6 +463,27 @@ impl Checker<'_, '_, '_, '_> {
                 after: None,
                 rule: None,
             },
+        );
+    }
+
+    /// A record a test uses that only demo data creates, when the target
+    /// makes databases without demo data by default.
+    fn demo_record(
+        &mut self,
+        reference: &XmlRef,
+        record: &Xmlid,
+        xmlid: String,
+        evidence: Evidence,
+    ) {
+        let changes = self.versions.changes;
+        if reference.kind != RefKind::Test || !record.demo || changes.target.demo_by_default() {
+            return;
+        }
+        self.push(
+            &reference.location,
+            Problem::DemoRecord { xmlid },
+            since(changes.source.demo_by_default()),
+            evidence,
         );
     }
 

@@ -60,6 +60,9 @@ pub enum PtxCode {
     A102,
     /// A record the module refers to by external id is gone.
     R601,
+    /// A test relies on a record only demo data creates, and the target
+    /// makes databases without demo data by default.
+    T802,
     /// A stored column or table goes away, and its data with it.
     D901,
     /// A selection field no longer accepts keys rows may hold.
@@ -93,6 +96,7 @@ impl PtxCode {
             Self::A101 => "PTX-A101",
             Self::A102 => "PTX-A102",
             Self::R601 => "PTX-R601",
+            Self::T802 => "PTX-T802",
             Self::D901 => "PTX-D901",
             Self::D902 => "PTX-D902",
             Self::D903 => "PTX-D903",
@@ -108,6 +112,7 @@ impl PtxCode {
             | Self::P403
             | Self::P404
             | Self::A102
+            | Self::T802
             | Self::D902
             | Self::D903 => Severity::Warning,
             _ => Severity::Error,

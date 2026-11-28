@@ -45,6 +45,15 @@ impl OdooVersion {
         }
     }
 
+    /// Whether a new database gets demo data unless told otherwise. Odoo 19
+    /// replaced `--without-demo` with `--with-demo`, off by default.
+    pub fn demo_by_default(self) -> bool {
+        match self {
+            Self::V18 => true,
+            Self::V19 => false,
+        }
+    }
+
     /// The series string, as in `odoo/release.py`: `18.0`, `19.0`.
     pub fn series(self) -> &'static str {
         match self {

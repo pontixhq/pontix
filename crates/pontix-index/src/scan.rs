@@ -30,7 +30,8 @@ pub struct Module {
     pub python_files: Vec<PathBuf>,
     /// Model classes from those files, in the order Python defines them.
     pub models: Vec<ModelDef>,
-    /// `env.ref(...)` calls in those files.
+    /// `env.ref(...)` calls in those files, then in the module's tests
+    /// ([`pontix_core::RefKind::Test`]) when its code is read.
     pub xmlid_refs: Vec<XmlRef>,
     /// Fields and models used by code outside model classes in those files.
     /// Methods of models keep theirs in [`pontix_core::MethodDef::code_refs`].
@@ -200,11 +201,13 @@ fn scan_module(
             .collect(),
     );
     let data = data_files(root, dir, &manifest, &mut addons.diagnostics);
-    let test_refs = if found.read_code {
+    let (test_refs, test_records) = if found.read_code {
         load_tests(root, dir, &name)
     } else {
-        Vec::new()
+        Default::default()
     };
+    let mut xmlid_refs = loaded.xmlid_refs;
+    xmlid_refs.extend(test_records);
     addons.modules.push(Module {
         name,
         path: dir.to_path_buf(),
@@ -213,7 +216,7 @@ fn scan_module(
         python_files: loaded.files,
         // Filled in once candidates are resolved.
         models: Vec::new(),
-        xmlid_refs: loaded.xmlid_refs,
+        xmlid_refs,
         code_refs: loaded.code_refs,
         test_refs,
         data,
@@ -263,6 +266,7 @@ fn data_files(
 mod tests {
     use super::*;
     use crate::MAX_FILE_SIZE;
+    use pontix_core::RefKind;
 
     /// An addons path in a temporary directory, removed when dropped.
     struct Tree {
@@ -671,6 +675,7 @@ mod tests {
             "class TestM(TransactionCase):",
             "    def test_one(self):",
             "        self.env['res.partner'].create({'groups_id': []})",
+            "        self.env.ref('base.res_partner_1')",
             "class Fake(models.Model):",
             "    _name = 'm.fake'",
             "    def run(self):",
@@ -696,6 +701,12 @@ mod tests {
         // `from .. import models` leaves tests/ and is not read again, and
         // the fake model's own fields are not the module's.
         assert_eq!(ref_paths(&module.test_refs), ["", "groups_id", "login", ""]);
+        let records: Vec<(&str, RefKind)> = module
+            .xmlid_refs
+            .iter()
+            .map(|found| (found.xmlid.as_str(), found.kind))
+            .collect();
+        assert_eq!(records, [("base.res_partner_1", RefKind::Test)]);
     }
 
     #[test]

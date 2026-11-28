@@ -215,6 +215,12 @@ pub enum Problem {
         /// How the module refers to it.
         how: RefKind,
     },
+    /// A test uses a record only demo data creates, and the target makes
+    /// databases without demo data unless told otherwise.
+    DemoRecord {
+        /// The external id, as `module.xmlid`.
+        xmlid: String,
+    },
     /// The manifest version is of another series than the target: Odoo
     /// treats the module as not installable, with only a log warning.
     ManifestVersion {

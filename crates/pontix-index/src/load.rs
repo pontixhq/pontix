@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use pontix_core::{CodeRef, CodeRoot, Diagnostic, DiagnosticKind, ModelDef, ModuleName, XmlRef};
+use pontix_core::{
+    CodeRef, CodeRoot, Diagnostic, DiagnosticKind, ModelDef, ModuleName, RefKind, XmlRef,
+};
 use pontix_parsers::{Candidate, Import, parse_python_with};
 
 use crate::files::Root;
@@ -65,12 +67,16 @@ pub(crate) fn load(root: &Root, module_dir: &Path, module: &ModuleName, read_cod
     loader.out
 }
 
-/// The fields and models the module's tests use: the files Odoo's test
-/// runner imports from `tests/__init__.py`, without leaving `tests/`.
-/// Classes there are never models of the module, so only what their code
-/// opens through `env` counts; what they read could not be read is not the
-/// module's problem and is not reported.
-pub(crate) fn load_tests(root: &Root, module_dir: &Path, module: &ModuleName) -> Vec<CodeRef> {
+/// What the module's tests use: the files Odoo's test runner imports from
+/// `tests/__init__.py`, without leaving `tests/`. Classes there are never
+/// models of the module, so only what their code opens through `env`
+/// counts, along with the records they `env.ref`; what could not be read is
+/// not the module's problem and is not reported.
+pub(crate) fn load_tests(
+    root: &Root,
+    module_dir: &Path,
+    module: &ModuleName,
+) -> (Vec<CodeRef>, Vec<XmlRef>) {
     let tests = module_dir.join("tests");
     let mut loader = Loader {
         root,
@@ -97,7 +103,16 @@ pub(crate) fn load_tests(root: &Root, module_dir: &Path, module: &ModuleName) ->
                 .filter(|found| found.root != CodeRoot::Own),
         );
     }
-    refs
+    let records = loader
+        .out
+        .xmlid_refs
+        .into_iter()
+        .map(|reference| XmlRef {
+            kind: RefKind::Test,
+            ..reference
+        })
+        .collect();
+    (refs, records)
 }
 
 /// What one dotted name refers to.

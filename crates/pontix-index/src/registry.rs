@@ -5,6 +5,7 @@
 //! kept apart: they are reachable, but they belong to the other model.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use crate::Installation;
 use pontix_core::resolve::model_name;
@@ -275,12 +276,16 @@ fn inherit<'a>(views: &mut BTreeMap<ModelName, ModelView<'a>>) {
 /// A record an external id names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Xmlid<'a> {
-    /// The record's model, such as `ir.ui.view` or `res.groups`.
-    pub model: ModelName,
+    /// The record's model, such as `ir.ui.view` or `res.groups`. `None`
+    /// when `_update_xmlids` names a record made elsewhere.
+    pub model: Option<ModelName>,
     /// Where the record is first declared.
     pub location: Location,
     /// The view, for an `ir.ui.view` record or a `<template>`.
     pub view: Option<&'a View>,
+    /// Whether only demo files declare it: the record is not there in a
+    /// database without demo data.
+    pub demo: bool,
 }
 
 /// Every external id of the installation, as `module.xmlid`: the records its
@@ -288,6 +293,8 @@ pub struct Xmlid<'a> {
 /// and field (`field_sale_order__name`) a module declares. A module that
 /// writes another module's record, as `<record id="sale.view_order_form">`,
 /// updates it; the first declaration is kept as where the record comes from.
+/// `_update_xmlids` calls in data files declare ids too. A record is demo
+/// only while no data file declares it.
 pub fn xmlids<'a>(installation: &Installation<'a>) -> BTreeMap<String, Xmlid<'a>> {
     let mut found = BTreeMap::new();
     for &module in &installation.modules {
@@ -297,31 +304,53 @@ pub fn xmlids<'a>(installation: &Installation<'a>) -> BTreeMap<String, Xmlid<'a>
             found
                 .entry(format!("{}.model_{stem}", module.name))
                 .or_insert_with(|| Xmlid {
-                    model: ModelName::new("ir.model"),
+                    model: Some(ModelName::new("ir.model")),
                     location: def.location.clone(),
                     view: None,
+                    demo: false,
                 });
             for field in &def.fields {
                 found
                     .entry(format!("{}.field_{stem}__{}", module.name, field.name))
                     .or_insert_with(|| Xmlid {
-                        model: ModelName::new("ir.model.fields"),
+                        model: Some(ModelName::new("ir.model.fields")),
                         location: field.location.clone(),
                         view: None,
+                        demo: false,
                     });
             }
         }
-        for (_, data) in &module.data {
+        let demo: Vec<PathBuf> = module
+            .manifest
+            .demo
+            .iter()
+            .map(|file| module.path.join(file))
+            .collect();
+        for (path, data) in &module.data {
+            let in_demo = demo.contains(path);
             for record in &data.records {
                 let Some(id) = &record.id else {
                     continue;
                 };
                 found
                     .entry(qualified(&module.name, id))
+                    .and_modify(|found: &mut Xmlid| found.demo &= in_demo)
                     .or_insert_with(|| Xmlid {
-                        model: record.model.clone(),
+                        model: Some(record.model.clone()),
                         location: record.location.clone(),
                         view: record.view.as_ref(),
+                        demo: in_demo,
+                    });
+            }
+            for (id, location) in &data.xmlids {
+                found
+                    .entry(qualified(&module.name, id))
+                    .and_modify(|found: &mut Xmlid| found.demo &= in_demo)
+                    .or_insert_with(|| Xmlid {
+                        model: None,
+                        location: location.clone(),
+                        view: None,
+                        demo: in_demo,
                     });
             }
         }

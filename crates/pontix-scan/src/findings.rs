@@ -1,7 +1,7 @@
 //! Issues turned into findings: one per module, PTX code and subject, with
 //! every place it shows up, a severity and the basis it is reported on.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pontix_core::{
     Basis, CodeUse, CoreBasis, Finding, ModuleName, OdooVersion, PtxCode, RefKind, Severity,
@@ -40,7 +40,11 @@ pub struct Report {
 pub fn report(scan: &Scan) -> Report {
     let target = scan.changes.target.series();
     let mut grouped: BTreeMap<(ModuleName, Severity, PtxCode, String), Finding> = BTreeMap::new();
+    let mut demo: BTreeMap<ModuleName, BTreeSet<&str>> = BTreeMap::new();
     for issue in &scan.issues {
+        if let Problem::DemoRecord { xmlid } = &issue.problem {
+            demo.entry(issue.module.clone()).or_default().insert(xmlid);
+        }
         let classified = classify(issue, target);
         let severity = match issue.since {
             Since::Before => Severity::Info,
@@ -69,6 +73,11 @@ pub fn report(scan: &Scan) -> Report {
     }
     let mut findings: Vec<Finding> = grouped.into_values().collect();
     for finding in &mut findings {
+        if finding.code == PtxCode::T802
+            && let Some(records) = demo.get(&finding.module)
+        {
+            finding.message = demo_message(records, target);
+        }
         finding
             .locations
             .sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
@@ -306,13 +315,23 @@ fn classify(issue: &Issue, target: &str) -> Classified {
                 },
             )
         },
-        Problem::RecordGone { xmlid, how } => plain(
-            PtxCode::R601,
-            xmlid.clone(),
-            format!(
-                "Record {xmlid} does not exist in {target} ({}).",
-                ref_kind(*how)
-            ),
+        Problem::RecordGone { xmlid, how } => Classified {
+            severity: (*how == RefKind::Test).then_some(Severity::Warning),
+            ..plain(
+                PtxCode::R601,
+                xmlid.clone(),
+                format!(
+                    "Record {xmlid} does not exist in {target} ({}).",
+                    ref_kind(*how)
+                ),
+            )
+        },
+        // One finding per module: the fix is one choice for all its tests.
+        // The message, naming the records, is written once they are known.
+        Problem::DemoRecord { xmlid } => plain(
+            PtxCode::T802,
+            issue.module.to_string(),
+            demo_message(&BTreeSet::from([xmlid.as_str()]), target),
         ),
         Problem::DataGone {
             model,
@@ -419,6 +438,25 @@ fn code_use(how: CodeUse) -> &'static str {
     }
 }
 
+/// The message of a T802 finding: how many demo records the tests use, and
+/// the first few.
+fn demo_message(records: &BTreeSet<&str>, target: &str) -> String {
+    // Four names fit as well as three and an ellipsis.
+    const NAMED: usize = 3;
+    let mut named: Vec<&str> = records.iter().copied().collect();
+    if named.len() > NAMED + 1 {
+        named.truncate(NAMED);
+        named.push("...");
+    }
+    let records = match records.len() {
+        1 => format!("record {}", named.join(", ")),
+        count => format!("{count} records ({})", named.join(", ")),
+    };
+    format!(
+        "Tests use {records} that only demo data creates: {target} makes databases without demo data unless run with --with-demo."
+    )
+}
+
 fn ref_kind(how: RefKind) -> &'static str {
     match how {
         RefKind::Ref => "ref=",
@@ -428,5 +466,6 @@ fn ref_kind(how: RefKind) -> &'static str {
         RefKind::Parent => "menu parent",
         RefKind::InheritId => "inherited view",
         RefKind::Python => "env.ref() in Python",
+        RefKind::Test => "env.ref() in tests",
     }
 }

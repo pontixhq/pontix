@@ -13,6 +13,9 @@ pub struct DataFile {
     pub models: Vec<(ModelName, Location)>,
     /// References to records by external id, in file order.
     pub refs: Vec<XmlRef>,
+    /// External ids that `ir.model.data._update_xmlids` gives records made
+    /// elsewhere, such as `stock.stock_location_stock`, as written.
+    pub xmlids: Vec<(String, Location)>,
 }
 
 /// A record the file creates or updates.
@@ -81,6 +84,8 @@ pub enum RefKind {
     InheritId,
     /// `env.ref('...')` in Python.
     Python,
+    /// `env.ref('...')` in the module's tests.
+    Test,
 }
 
 /// A reference to a record by external id.
