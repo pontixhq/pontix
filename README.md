@@ -19,6 +19,29 @@ source.
 
 Apache-2.0 crates never depend on FSL crates.
 
+## Usage
+
+`pontix plan` checks custom modules for an upgrade to the next Odoo version.
+It needs the Odoo source of both versions (folders with `odoo/release.py`)
+and reads code only: it never runs module code or downloads anything.
+
+```sh
+pontix plan --from 18.0 --to 19.0 \
+  --core-from ~/odoo/18.0 --core-to ~/odoo/19.0 \
+  --addons ~/client/custom
+
+# JSON for tools and AI agents
+pontix plan ... --format json --output plan.json
+
+# In CI: exit 1 when there is an error
+pontix plan ... --fail-on error
+```
+
+Each finding has a PTX code, a severity, where the custom module refers to
+core, and where core declares it in each version. Exit codes: 0 done, 1 a
+finding reached `--fail-on`, 2 bad input. A report always lists what Pontix
+does not check yet; no finding does not mean the upgrade is safe.
+
 ## Development
 
 ```sh

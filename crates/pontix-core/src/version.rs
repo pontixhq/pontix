@@ -15,6 +15,36 @@ pub enum OdooVersion {
 }
 
 impl OdooVersion {
+    /// The version written as a series, `18.0`, or as its major number,
+    /// `18`. `None` for a version Pontix does not know.
+    pub fn parse(written: &str) -> Option<Self> {
+        let written = written.trim();
+        let major = written.strip_suffix(".0").unwrap_or(written);
+        match major {
+            "18" => Some(Self::V18),
+            "19" => Some(Self::V19),
+            _ => None,
+        }
+    }
+
+    /// The version of Odoo's `version_info[:2]`, as `odoo/release.py`
+    /// writes it.
+    pub fn from_release(major: u32, minor: u32) -> Option<Self> {
+        match (major, minor) {
+            (18, 0) => Some(Self::V18),
+            (19, 0) => Some(Self::V19),
+            _ => None,
+        }
+    }
+
+    /// The version that follows: the only one Pontix upgrades to.
+    pub fn next(self) -> Option<Self> {
+        match self {
+            Self::V18 => Some(Self::V19),
+            Self::V19 => None,
+        }
+    }
+
     /// The series string, as in `odoo/release.py`: `18.0`, `19.0`.
     pub fn series(self) -> &'static str {
         match self {
@@ -112,6 +142,18 @@ fn is_python_int(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versions_are_read_as_written_and_follow_each_other() {
+        assert_eq!(OdooVersion::parse("18.0"), Some(OdooVersion::V18));
+        assert_eq!(OdooVersion::parse(" 19 "), Some(OdooVersion::V19));
+        assert_eq!(OdooVersion::parse("17.0"), None);
+        assert_eq!(OdooVersion::parse("saas~18.2"), None);
+        assert_eq!(OdooVersion::from_release(19, 0), Some(OdooVersion::V19));
+        assert_eq!(OdooVersion::from_release(18, 2), None);
+        assert_eq!(OdooVersion::V18.next(), Some(OdooVersion::V19));
+        assert_eq!(OdooVersion::V19.next(), None);
+    }
 
     #[test]
     fn short_and_own_series_versions_are_adapted() {
