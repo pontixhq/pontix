@@ -16,10 +16,15 @@
 #![forbid(unsafe_code)]
 
 mod check;
+mod data;
+mod findings;
+mod manifest;
 mod path;
 
+pub use findings::{NOT_COVERED, Report, report};
+
 use pontix_core::{
-    ChangeSet, Confidence, FieldName, FieldType, Location, ModelName, ModuleName, RefKind,
+    ChangeSet, Confidence, FieldName, FieldType, Location, ModelName, ModuleName, RefKind, Storage,
 };
 use pontix_index::{Addons, InstallOptions, install, install_with};
 
@@ -65,6 +70,9 @@ pub struct Evidence {
     pub before: Option<Location>,
     /// In the target version.
     pub after: Option<Location>,
+    /// The Odoo rule that differs between the versions, when the issue comes
+    /// from a rule rather than from something core declares.
+    pub rule: Option<&'static str>,
 }
 
 /// A rename Pontix suspects, with how sure it is.
@@ -196,6 +204,56 @@ pub enum Problem {
         /// How the module refers to it.
         how: RefKind,
     },
+    /// The manifest version is of another series than the target: Odoo
+    /// treats the module as not installable, with only a log warning.
+    ManifestVersion {
+        /// The version as written.
+        written: String,
+    },
+    /// The module's manifest is `__openerp__.py`, which the target version
+    /// no longer reads: the module disappears.
+    ManifestFileIgnored,
+    /// The manifest is not one literal expression: Odoo ignores the module.
+    ManifestUnreadable,
+    /// An import inside the module points to nothing: the module fails to
+    /// load.
+    ImportBroken {
+        /// The import as written.
+        import: String,
+    },
+    /// Core drops a column or table that held data: a field removed or no
+    /// longer stored, or a model removed. Applies to every database where the
+    /// core module is installed.
+    DataGone {
+        /// The model.
+        model: ModelName,
+        /// The field; `None` for the model's whole table.
+        field: Option<FieldName>,
+        /// Where the values lived.
+        storage: Storage,
+        /// What it was probably renamed to: model and field.
+        renamed: Option<Renamed<(ModelName, Option<FieldName>)>>,
+    },
+    /// Core no longer accepts selection keys that stored rows may hold.
+    SelectionKeysGone {
+        /// The model.
+        model: ModelName,
+        /// The field.
+        field: FieldName,
+        /// The keys removed.
+        keys: Vec<String>,
+    },
+    /// A stored core field changes type: its values must be converted.
+    StoredTypeChanged {
+        /// The model.
+        model: ModelName,
+        /// The field.
+        field: FieldName,
+        /// Type in the source version.
+        from: FieldType,
+        /// Type in the target version.
+        to: FieldType,
+    },
     /// A model the module defines also exists in core now.
     ModelNameTaken {
         /// The model.
@@ -246,6 +304,8 @@ pub fn scan(
         upgrading,
         changes: &changes,
     });
+    issues.extend(manifest::check(source, target, upgrading));
+    issues.extend(data::check(&changes, &core_source));
     issues.sort_by(|a, b| {
         (&a.module, &a.at.file, a.at.line).cmp(&(&b.module, &b.at.file, b.at.line))
     });

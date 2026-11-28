@@ -10,7 +10,8 @@ use crate::Installation;
 use pontix_core::resolve::model_name;
 use pontix_core::storage::{self, Storage};
 use pontix_core::{
-    FieldAttrs, FieldName, FieldType, Location, MethodDef, ModelName, ModuleName, View, Written,
+    FieldAttrs, FieldName, FieldType, Location, MethodDef, ModelBase, ModelName, ModuleName, View,
+    Written,
 };
 
 /// A model as a whole in one version: everything its class definitions
@@ -18,6 +19,8 @@ use pontix_core::{
 pub struct ModelView<'a> {
     /// Where the model is first defined.
     pub first: Location,
+    /// The `odoo.models` class of the class that defines it.
+    pub base: ModelBase,
     /// Whether it has a table: `None` when Pontix cannot tell.
     pub has_table: Option<bool>,
     /// Fields its own definitions declare.
@@ -136,6 +139,7 @@ pub fn models<'a>(installation: &Installation<'a>) -> BTreeMap<ModelName, ModelV
             .any(|definition| definition.def.table_query);
         let mut view = ModelView {
             first: first.def.location.clone(),
+            base: first.def.base,
             has_table: storage::has_table(first.def.base, auto, table_query),
             fields: BTreeMap::new(),
             methods: BTreeMap::new(),

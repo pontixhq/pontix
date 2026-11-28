@@ -15,6 +15,11 @@ use pontix_index::{Installation, Module};
 use crate::path::{Walk, lookup, walk};
 use crate::{Evidence, Issue, ModelUse, PathUse, Problem, Renamed, Since};
 
+/// Where Odoo 19 names a class's model: only a string `_inherit` becomes
+/// `_name`, otherwise the name comes from the class name. Odoo 18 used a
+/// one-item `_inherit` list as the name too.
+const MODEL_NAME_RULE: &str = "odoo/orm/models.py, MetaModel (19.0) vs odoo/models.py (18.0)";
+
 /// One version: the installation with the modules being upgraded, and the
 /// core it installs on its own.
 pub(crate) struct Side<'i, 'a> {
@@ -71,6 +76,17 @@ pub(crate) fn check(versions: &Versions<'_, '_, '_>) -> Vec<Issue> {
     dependencies(versions, &mut issues);
     for module in &versions.source.full.modules {
         if !versions.upgrading.contains(&module.name) {
+            continue;
+        }
+        // A module the target cannot find at all is reported on its manifest
+        // alone: everything else about it would fail the same way.
+        if !versions
+            .target
+            .full
+            .modules
+            .iter()
+            .any(|found| found.name == module.name)
+        {
             continue;
         }
         let mut checker = Checker {
@@ -151,6 +167,7 @@ fn dependencies(versions: &Versions<'_, '_, '_>, issues: &mut Vec<Issue>) {
             evidence: Evidence {
                 before,
                 after: None,
+                rule: None,
             },
         });
     }
@@ -178,7 +195,10 @@ impl Checker<'_, '_, '_, '_> {
                     to: renamed_to,
                 },
                 Since::Upgrade,
-                Evidence::default(),
+                Evidence {
+                    rule: Some(MODEL_NAME_RULE),
+                    ..Evidence::default()
+                },
             );
         }
 
@@ -208,6 +228,7 @@ impl Checker<'_, '_, '_, '_> {
                 Evidence {
                     before: None,
                     after,
+                    rule: None,
                 },
             );
         }
@@ -352,6 +373,7 @@ impl Checker<'_, '_, '_, '_> {
             Evidence {
                 before,
                 after: None,
+                rule: None,
             },
         );
     }
@@ -400,6 +422,7 @@ impl Checker<'_, '_, '_, '_> {
             Evidence {
                 before,
                 after: None,
+                rule: None,
             },
         );
     }
@@ -452,6 +475,7 @@ impl Checker<'_, '_, '_, '_> {
             Evidence {
                 before,
                 after: None,
+                rule: None,
             },
         );
     }
@@ -480,6 +504,7 @@ impl Checker<'_, '_, '_, '_> {
                 Evidence {
                     before: Some(before.first.clone()),
                     after: None,
+                    rule: None,
                 },
             ),
             Some(after) if after.field_type != before.field_type => self.push(
@@ -494,6 +519,7 @@ impl Checker<'_, '_, '_, '_> {
                 Evidence {
                     before: Some(before.type_at.clone()),
                     after: Some(after.type_at.clone()),
+                    rule: None,
                 },
             ),
             _ => {}
@@ -522,6 +548,7 @@ impl Checker<'_, '_, '_, '_> {
                 Evidence {
                     before: Some(before.first.location.clone()),
                     after: None,
+                    rule: None,
                 },
             );
             return;
@@ -529,6 +556,7 @@ impl Checker<'_, '_, '_, '_> {
         let evidence = Evidence {
             before: Some(before.first.location.clone()),
             after: Some(after.first.location.clone()),
+            rule: None,
         };
         if before.first.params != after.first.params {
             self.push(

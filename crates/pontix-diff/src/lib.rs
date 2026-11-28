@@ -103,7 +103,8 @@ fn diff_model(
             (Some(before), Some(after)) => {
                 if let (Some(before), Some(after)) = (old.fields.get(field), new.fields.get(field))
                 {
-                    compare_field(model, field, before, after, changes);
+                    let storage = old.storage(before);
+                    compare_field(model, field, (before, after), storage, changes);
                 }
                 compare_data(model, field, (old, before), (new, after), changes);
             }
@@ -224,8 +225,8 @@ fn storage_change(
 fn compare_field(
     model: &ModelName,
     field: &FieldName,
-    before: &FieldView<'_>,
-    after: &FieldView<'_>,
+    (before, after): (&FieldView<'_>, &FieldView<'_>),
+    storage: Storage,
     changes: &mut Vec<Change>,
 ) {
     if before.field_type != after.field_type {
@@ -234,6 +235,7 @@ fn compare_field(
             field: field.clone(),
             from: before.field_type.clone(),
             to: after.field_type.clone(),
+            storage,
             before: before.type_at.clone(),
             after: after.type_at.clone(),
         });
@@ -521,6 +523,7 @@ mod tests {
                     field: FieldName::new("note"),
                     from: FieldType::Char,
                     to: FieldType::Html,
+                    storage: Storage::Column,
                     before: at("models.py", 12),
                     after: at("models.py", 32),
                 },

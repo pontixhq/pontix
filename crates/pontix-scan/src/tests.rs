@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use pontix_core::{
     ApiDecorator, FieldAttrs, FieldDef, FieldPaths, FieldType, Inherit, Manifest, MethodDef,
-    ModelBase, ModelDef, OdooVersion, RefKind, Written,
+    ModelBase, ModelDef, OdooVersion, RefKind, Storage, Written,
 };
 use pontix_index::Module;
 
@@ -273,10 +273,19 @@ fn scanned() -> Scan {
     scan(&source(), &target(), &[ModuleName::new("custom_sale")], &[])
 }
 
+/// What a scan finds in the custom code itself: not its manifest version,
+/// and not what core does to data.
+fn in_code(issues: Vec<Issue>) -> Vec<Issue> {
+    issues
+        .into_iter()
+        .filter(|issue| issue.module.as_str().starts_with("custom"))
+        .filter(|issue| !matches!(issue.problem, Problem::ManifestVersion { .. }))
+        .collect()
+}
+
 #[test]
 fn finds_each_kind_of_breakage_with_its_evidence() {
-    let found: Vec<(u32, Problem, Since)> = scanned()
-        .issues
+    let found: Vec<(u32, Problem, Since)> = in_code(scanned().issues)
         .into_iter()
         .map(|issue| (issue.at.line.get(), issue.problem, issue.since))
         .collect();
@@ -410,6 +419,7 @@ fn evidence_points_at_core_in_each_version() {
         Evidence {
             before: Some(at("base/models.py", 4)),
             after: None,
+            rule: None,
         }
     );
     assert_eq!(
@@ -417,6 +427,7 @@ fn evidence_points_at_core_in_each_version() {
         Evidence {
             before: Some(at("sale/models.py", 20)),
             after: Some(at("sale/models.py", 20)),
+            rule: None,
         }
     );
     assert_eq!(
@@ -424,6 +435,7 @@ fn evidence_points_at_core_in_each_version() {
         Evidence {
             before: Some(at("sale_legacy/__manifest__.py", 1)),
             after: None,
+            rule: None,
         }
     );
 }
@@ -432,11 +444,11 @@ fn evidence_points_at_core_in_each_version() {
 fn an_unchanged_core_gives_no_issues() {
     let mut target = source();
     target.version = OdooVersion::V19;
-    let issues: Vec<Issue> = scan(&source(), &target, &[ModuleName::new("custom_sale")], &[])
-        .issues
-        .into_iter()
-        .filter(|issue| issue.since == Since::Upgrade)
-        .collect();
+    let issues: Vec<Issue> =
+        in_code(scan(&source(), &target, &[ModuleName::new("custom_sale")], &[]).issues)
+            .into_iter()
+            .filter(|issue| issue.since == Since::Upgrade)
+            .collect();
     assert_eq!(issues, []);
 }
 
@@ -460,11 +472,11 @@ fn a_class_that_names_another_model_in_the_target_is_reported() {
             .modules
             .push(module("custom_list", &["sale"], None, vec![class.clone()]));
     }
-    let problems: Vec<Problem> = scan(&source, &target, &[ModuleName::new("custom_list")], &[])
-        .issues
-        .into_iter()
-        .map(|issue| issue.problem)
-        .collect();
+    let problems: Vec<Problem> =
+        in_code(scan(&source, &target, &[ModuleName::new("custom_list")], &[]).issues)
+            .into_iter()
+            .map(|issue| issue.problem)
+            .collect();
     assert_eq!(
         problems,
         // In 18 a one-item `_inherit` list names the model; in 19 only a
@@ -671,4 +683,142 @@ fn checks_views_records_and_external_ids_in_data_files() {
             gone(MINE, 12),
         ]
     );
+}
+
+#[test]
+fn reports_manifest_versions_and_what_core_does_to_data() {
+    let issues = scanned().issues;
+    let manifest: Vec<&Problem> = issues
+        .iter()
+        .filter(|issue| issue.module.as_str() == "custom_sale" && issue.at.line.get() == 1)
+        .map(|issue| &issue.problem)
+        .collect();
+    assert!(manifest.contains(&&Problem::ManifestVersion {
+        written: "18.0.1.0.0".to_string()
+    }));
+    let data: Vec<(&str, &Problem)> = issues
+        .iter()
+        .filter(|issue| !issue.module.as_str().starts_with("custom"))
+        .map(|issue| (issue.module.as_str(), &issue.problem))
+        .collect();
+    let gone = |model: &str, field: Option<&str>| Problem::DataGone {
+        model: name(model),
+        field: field.map(FieldName::new),
+        storage: Storage::Column,
+        renamed: None,
+    };
+    assert_eq!(
+        data,
+        [
+            ("base", &gone("res.partner", Some("fax"))),
+            ("sale", &gone("sale.legacy", None)),
+            (
+                "sale",
+                &Problem::StoredTypeChanged {
+                    model: name("sale.order"),
+                    field: FieldName::new("amount"),
+                    from: FieldType::Monetary,
+                    to: FieldType::Float,
+                }
+            ),
+            ("sale", &gone("sale.order", Some("note"))),
+            ("sale", &gone("sale.order", Some("legacy_state"))),
+        ]
+    );
+}
+
+#[test]
+fn findings_group_issues_with_a_code_severity_and_basis() {
+    use pontix_core::{Basis, PtxCode, Severity};
+
+    let report = report(&scanned());
+    assert_eq!(report.not_covered, NOT_COVERED);
+    let mine: Vec<(PtxCode, Severity, &str, usize)> = report
+        .findings
+        .iter()
+        .filter(|finding| finding.module.as_str() == "custom_sale")
+        .map(|finding| {
+            (
+                finding.code,
+                finding.severity,
+                finding.subject.as_str(),
+                finding.locations.len(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        mine,
+        [
+            (PtxCode::M001, Severity::Error, "sale_legacy", 1),
+            (PtxCode::M002, Severity::Error, "custom_sale", 1),
+            // Used twice: as a comodel and as an inherited model.
+            (PtxCode::M101, Severity::Error, "sale.legacy", 2),
+            (PtxCode::M103, Severity::Error, "custom.thing", 1),
+            (PtxCode::F201, Severity::Error, "res.partner.fax", 1),
+            (PtxCode::F201, Severity::Error, "sale.order.note", 1),
+            (PtxCode::F203, Severity::Error, "sale.order.amount", 1),
+            (PtxCode::P401, Severity::Error, "sale.order._old_hook", 1),
+            (
+                PtxCode::F205,
+                Severity::Warning,
+                "sale.order.legacy_state",
+                1
+            ),
+            (
+                PtxCode::P402,
+                Severity::Warning,
+                "sale.order.action_confirm",
+                1
+            ),
+            (
+                PtxCode::P403,
+                Severity::Warning,
+                "sale.order._prepare_invoice",
+                1
+            ),
+            (PtxCode::F201, Severity::Info, "sale.order.ghost", 1),
+        ]
+    );
+    let manifest = report
+        .findings
+        .iter()
+        .find(|finding| finding.code == PtxCode::M002)
+        .expect("the manifest finding");
+    assert!(matches!(manifest.basis, Basis::Rule(_)));
+    let ghost = report
+        .findings
+        .iter()
+        .find(|finding| finding.subject == "sale.order.ghost")
+        .expect("the finding broken before the upgrade");
+    assert_eq!(ghost.basis, Basis::NotInCore);
+    let data = report
+        .findings
+        .iter()
+        .find(|finding| finding.code == PtxCode::D901 && finding.subject == "sale.order.note")
+        .expect("the data finding");
+    assert_eq!(data.module.as_str(), "sale");
+    assert!(matches!(&data.basis, Basis::Core(core) if core.after().is_none()));
+}
+
+#[test]
+fn only_renamed_parameters_are_info() {
+    use pontix_core::{PtxCode, Severity};
+
+    let mut target = target();
+    let sale = &mut target.modules[1].models[0];
+    sale.methods[0].params = vec!["force".to_string()];
+    let mut source = source();
+    source.modules[1].models[0].methods[0].params = vec!["forced".to_string()];
+    let report = report(&scan(
+        &source,
+        &target,
+        &[ModuleName::new("custom_sale")],
+        &[],
+    ));
+    let params = report
+        .findings
+        .iter()
+        .find(|finding| finding.code == PtxCode::P402)
+        .expect("the parameters finding");
+    assert_eq!(params.severity, Severity::Info);
 }

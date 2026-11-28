@@ -229,6 +229,9 @@ pub enum Change {
         from: FieldType,
         /// Type in the target version.
         to: FieldType,
+        /// Where its values lived in the source version: stored values must
+        /// be converted.
+        storage: Storage,
         /// Where the source type is declared.
         before: Location,
         /// Where the target type is declared.
