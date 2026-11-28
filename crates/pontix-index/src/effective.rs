@@ -90,6 +90,8 @@ mod tests {
             manifest,
             python_files: Vec::new(),
             models: Vec::new(),
+            xmlid_refs: Vec::new(),
+            data: Vec::new(),
         }
     }
 

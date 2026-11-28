@@ -6,11 +6,11 @@ use std::num::NonZeroU32;
 
 use pontix_core::resolve::{model_kind, model_name};
 use pontix_core::{
-    ApiDecorator, ChangeSet, DiagnosticKind, FieldDef, Location, MethodDef, ModelDef, ModelKind,
-    ModelName, ModuleName, Rename, Written,
+    ApiDecorator, ChangeSet, DiagnosticKind, FieldDef, FieldName, Location, MethodDef, ModelDef,
+    ModelKind, ModelName, ModuleName, Rename, View, Written, XmlRef,
 };
-use pontix_index::Installation;
-use pontix_index::registry::{self, MethodView, ModelView};
+use pontix_index::registry::{self, MethodView, ModelView, Xmlid, qualified};
+use pontix_index::{Installation, Module};
 
 use crate::path::{Walk, lookup, walk};
 use crate::{Evidence, Issue, ModelUse, PathUse, Problem, Renamed, Since};
@@ -28,6 +28,8 @@ pub(crate) struct Side<'i, 'a> {
     defined: BTreeSet<ModelName>,
     /// The same, for core alone.
     core_defined: BTreeSet<ModelName>,
+    /// Every external id, the upgraded modules' records included.
+    xmlids: BTreeMap<String, Xmlid<'a>>,
 }
 
 impl<'i, 'a> Side<'i, 'a> {
@@ -38,6 +40,7 @@ impl<'i, 'a> Side<'i, 'a> {
             core: registry::models(core),
             defined: defined(full),
             core_defined: defined(core),
+            xmlids: registry::xmlids(full),
         }
     }
 }
@@ -70,14 +73,15 @@ pub(crate) fn check(versions: &Versions<'_, '_, '_>) -> Vec<Issue> {
         if !versions.upgrading.contains(&module.name) {
             continue;
         }
+        let mut checker = Checker {
+            versions,
+            module: &module.name,
+            issues: &mut issues,
+        };
         for def in &module.models {
-            let mut class = Class {
-                versions,
-                module: &module.name,
-                issues: &mut issues,
-            };
-            class.check(def);
+            checker.class(def);
         }
+        checker.data(module);
     }
     issues
 }
@@ -152,15 +156,16 @@ fn dependencies(versions: &Versions<'_, '_, '_>, issues: &mut Vec<Issue>) {
     }
 }
 
-/// One class of a module being upgraded.
-struct Class<'c, 's, 'i, 'a> {
+/// One module being upgraded.
+struct Checker<'c, 's, 'i, 'a> {
     versions: &'c Versions<'s, 'i, 'a>,
     module: &'c ModuleName,
     issues: &'c mut Vec<Issue>,
 }
 
-impl Class<'_, '_, '_, '_> {
-    fn check(&mut self, def: &ModelDef) {
+impl Checker<'_, '_, '_, '_> {
+    /// A model class.
+    fn class(&mut self, def: &ModelDef) {
         let (source, target) = (&self.versions.source, &self.versions.target);
         let name = model_name(def, source.full.version).into_owned();
         let renamed_to = model_name(def, target.full.version).into_owned();
@@ -238,6 +243,117 @@ impl Class<'_, '_, '_, '_> {
             }
             self.overridden(&name, method);
         }
+    }
+
+    /// The module's data files and its `env.ref` calls.
+    fn data(&mut self, module: &Module) {
+        for (_, file) in &module.data {
+            for (model, at) in &file.models {
+                self.model(model, ModelUse::Record, at);
+            }
+            for record in &file.records {
+                self.model(&record.model, ModelUse::Record, &record.location);
+                if !self.versions.target.defined.contains(&record.model) {
+                    continue;
+                }
+                let id = record
+                    .id
+                    .as_deref()
+                    .map(|id| qualified(&module.name, id))
+                    .unwrap_or_default();
+                for (field, at) in &record.fields {
+                    let how = PathUse::RecordValue(id.clone());
+                    self.path(&record.model, field.as_str(), how, at);
+                }
+                let Some(view) = &record.view else {
+                    continue;
+                };
+                let Some(model) = self.view_model(&module.name, view) else {
+                    continue;
+                };
+                for field in &view.fields {
+                    let path: Vec<&str> = field
+                        .within
+                        .iter()
+                        .chain(std::iter::once(&field.name))
+                        .map(FieldName::as_str)
+                        .collect();
+                    let how = PathUse::View(id.clone());
+                    self.path(&model, &path.join("."), how, &field.location);
+                }
+            }
+            for reference in &file.refs {
+                self.xmlid(reference);
+            }
+        }
+        for reference in &module.xmlid_refs {
+            self.xmlid(reference);
+        }
+    }
+
+    /// The model of a view: its own `model`, or that of the views it
+    /// inherits, followed in the target version, then in the source one.
+    fn view_model(&self, module: &ModuleName, view: &View) -> Option<ModelName> {
+        if let Some(model) = &view.model {
+            return Some(model.clone());
+        }
+        let mut parent = view.inherit_id.as_deref().map(|id| qualified(module, id));
+        // Inheritance chains are short; a cycle must not loop forever.
+        for _ in 0..32 {
+            let id = parent?;
+            let found = self
+                .versions
+                .target
+                .xmlids
+                .get(&id)
+                .or_else(|| self.versions.source.xmlids.get(&id))?;
+            let view = found.view?;
+            if let Some(model) = &view.model {
+                return Some(model.clone());
+            }
+            let owner = id
+                .split_once('.')
+                .map(|(owner, _)| ModuleName::new(owner))?;
+            parent = view.inherit_id.as_deref().map(|id| qualified(&owner, id));
+        }
+        None
+    }
+
+    /// A reference to a record by external id.
+    fn xmlid(&mut self, reference: &XmlRef) {
+        let id = qualified(self.module, &reference.xmlid);
+        let Some((owner, local)) = id.split_once('.') else {
+            return;
+        };
+        // Records of the modules being upgraded, and those Odoo makes for
+        // modules and their categories, are not core's to break.
+        if self
+            .versions
+            .upgrading
+            .iter()
+            .any(|module| module.as_str() == owner)
+            || local.starts_with("module_")
+        {
+            return;
+        }
+        let (source, target) = (&self.versions.source, &self.versions.target);
+        if target.xmlids.contains_key(&id) {
+            return;
+        }
+        let before = source.xmlids.get(&id).map(|found| found.location.clone());
+        let existed = before.is_some();
+        self.push(
+            &reference.location,
+            Problem::RecordGone {
+                xmlid: id,
+                how: reference.kind,
+            },
+            since(existed),
+            Evidence {
+                before,
+                after: None,
+            },
+        );
     }
 
     /// A model the class inherits, delegates to or points a field at.

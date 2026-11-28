@@ -70,6 +70,13 @@ pub enum DiagnosticKind {
     /// `depends` leads back to this module. The snippet is the dependency
     /// that closes the loop.
     DependencyCycle,
+    /// A data file is not well-formed XML, or declares a DTD, which Pontix
+    /// refuses. The snippet is the parser's message.
+    InvalidXml,
+    /// A data file nests elements deeper than Pontix follows, which
+    /// protects against inputs built to exhaust the stack. The rest of the
+    /// file is still read.
+    XmlTooDeep,
 }
 
 /// Something a parser could not read, with the source text exactly as written.

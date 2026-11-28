@@ -7,9 +7,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::Installation;
+use pontix_core::resolve::model_name;
 use pontix_core::storage::{self, Storage};
 use pontix_core::{
-    FieldAttrs, FieldName, FieldType, Location, MethodDef, ModelName, ModuleName, Written,
+    FieldAttrs, FieldName, FieldType, Location, MethodDef, ModelName, ModuleName, View, Written,
 };
 
 /// A model as a whole in one version: everything its class definitions
@@ -255,5 +256,72 @@ fn inherit<'a>(views: &mut BTreeMap<ModelName, ModelView<'a>>) {
         methods.retain(|method, _| !view.methods.contains_key(method));
         view.inherited_fields = fields;
         view.inherited_methods = methods;
+    }
+}
+
+/// A record an external id names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Xmlid<'a> {
+    /// The record's model, such as `ir.ui.view` or `res.groups`.
+    pub model: ModelName,
+    /// Where the record is first declared.
+    pub location: Location,
+    /// The view, for an `ir.ui.view` record or a `<template>`.
+    pub view: Option<&'a View>,
+}
+
+/// Every external id of the installation, as `module.xmlid`: the records its
+/// data files declare, and those Odoo makes for each model (`model_sale_order`)
+/// and field (`field_sale_order__name`) a module declares. A module that
+/// writes another module's record, as `<record id="sale.view_order_form">`,
+/// updates it; the first declaration is kept as where the record comes from.
+pub fn xmlids<'a>(installation: &Installation<'a>) -> BTreeMap<String, Xmlid<'a>> {
+    let mut found = BTreeMap::new();
+    for &module in &installation.modules {
+        for def in &module.models {
+            let model = model_name(def, installation.version);
+            let stem = model.as_str().replace('.', "_");
+            found
+                .entry(format!("{}.model_{stem}", module.name))
+                .or_insert_with(|| Xmlid {
+                    model: ModelName::new("ir.model"),
+                    location: def.location.clone(),
+                    view: None,
+                });
+            for field in &def.fields {
+                found
+                    .entry(format!("{}.field_{stem}__{}", module.name, field.name))
+                    .or_insert_with(|| Xmlid {
+                        model: ModelName::new("ir.model.fields"),
+                        location: field.location.clone(),
+                        view: None,
+                    });
+            }
+        }
+        for (_, data) in &module.data {
+            for record in &data.records {
+                let Some(id) = &record.id else {
+                    continue;
+                };
+                found
+                    .entry(qualified(&module.name, id))
+                    .or_insert_with(|| Xmlid {
+                        model: record.model.clone(),
+                        location: record.location.clone(),
+                        view: record.view.as_ref(),
+                    });
+            }
+        }
+    }
+    found
+}
+
+/// `xmlid` of `module` as `module.xmlid`; one that names its module already
+/// is kept as written.
+pub fn qualified(module: &ModuleName, xmlid: &str) -> String {
+    if xmlid.contains('.') {
+        xmlid.to_string()
+    } else {
+        format!("{module}.{xmlid}")
     }
 }

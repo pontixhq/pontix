@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use pontix_core::{Diagnostic, DiagnosticKind, ModelDef, ModuleName};
+use pontix_core::{Diagnostic, DiagnosticKind, ModelDef, ModuleName, XmlRef};
 use pontix_parsers::{Candidate, Import, parse_python};
 
 use crate::files::Root;
@@ -16,6 +16,8 @@ pub(crate) struct Loaded {
     pub(crate) classes: Vec<Class>,
     /// What the base resolution needs from each file, in `files` order.
     pub(crate) sources: Vec<PythonSource>,
+    /// `env.ref(...)` calls in those files.
+    pub(crate) xmlid_refs: Vec<XmlRef>,
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
@@ -105,6 +107,7 @@ impl Loader<'_> {
         self.bound_names.insert(canonical, parsed.bound_names);
         self.out.files.push(path.to_path_buf());
         self.out.diagnostics.extend(parsed.diagnostics);
+        self.out.xmlid_refs.extend(parsed.xmlid_refs);
 
         let index = self.out.sources.len();
         self.out.sources.push(PythonSource {

@@ -9,6 +9,8 @@
 pub mod manifest;
 pub mod python;
 mod source;
+pub mod xml;
 
 pub use manifest::{ManifestFile, parse_manifest};
 pub use python::{Candidate, Import, PythonFile, parse_python};
+pub use xml::{XmlFile, parse_xml};

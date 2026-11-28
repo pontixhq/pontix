@@ -18,7 +18,9 @@
 mod check;
 mod path;
 
-use pontix_core::{ChangeSet, Confidence, FieldName, FieldType, Location, ModelName, ModuleName};
+use pontix_core::{
+    ChangeSet, Confidence, FieldName, FieldType, Location, ModelName, ModuleName, RefKind,
+};
 use pontix_index::{Addons, InstallOptions, install, install_with};
 
 /// What the scan found, and the core changes it was checked against.
@@ -83,6 +85,8 @@ pub enum ModelUse {
     Delegate,
     /// The comodel of one of its fields.
     Comodel(FieldName),
+    /// The model of a record, `<function>` or `<delete>` in a data file.
+    Record,
 }
 
 /// Where a field path is written.
@@ -96,6 +100,10 @@ pub enum PathUse {
     Onchange(String),
     /// `@api.constrains` of the method.
     Constrains(String),
+    /// A `<field>` of the view with this external id.
+    View(String),
+    /// A value the record with this external id sets in a data file.
+    RecordValue(String),
 }
 
 /// What is wrong with a reference to core.
@@ -180,6 +188,13 @@ pub enum Problem {
         method: String,
         /// Whether the override calls `super()`.
         calls_super: bool,
+    },
+    /// A record the module refers to by external id does not exist.
+    RecordGone {
+        /// The external id, as `module.xmlid`.
+        xmlid: String,
+        /// How the module refers to it.
+        how: RefKind,
     },
     /// A model the module defines also exists in core now.
     ModelNameTaken {

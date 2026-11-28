@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use pontix_core::{
     ApiDecorator, FieldAttrs, FieldDef, FieldPaths, FieldType, Inherit, Manifest, MethodDef,
-    ModelBase, ModelDef, OdooVersion, Written,
+    ModelBase, ModelDef, OdooVersion, RefKind, Written,
 };
 use pontix_index::Module;
 
@@ -98,6 +98,8 @@ fn module(name: &str, depends: &[&str], version: Option<&str>, models: Vec<Model
         },
         python_files: Vec::new(),
         models,
+        xmlid_refs: Vec::new(),
+        data: Vec::new(),
     }
 }
 
@@ -472,5 +474,201 @@ fn a_class_that_names_another_model_in_the_target_is_reported() {
             from: name("sale.order"),
             to: name("sale.order.custom"),
         }]
+    );
+}
+
+fn data(
+    file: &str,
+    records: Vec<pontix_core::Record>,
+    refs: Vec<pontix_core::XmlRef>,
+) -> (PathBuf, pontix_core::DataFile) {
+    (
+        PathBuf::from(file),
+        pontix_core::DataFile {
+            records,
+            models: Vec::new(),
+            refs,
+        },
+    )
+}
+
+fn view(
+    file: &str,
+    id: &str,
+    model: Option<&str>,
+    inherit: Option<&str>,
+    fields: &[(&str, u32)],
+    line: u32,
+) -> pontix_core::Record {
+    pontix_core::Record {
+        id: Some(id.to_string()),
+        model: name("ir.ui.view"),
+        fields: Vec::new(),
+        view: Some(pontix_core::View {
+            model: model.map(ModelName::new),
+            inherit_id: inherit.map(str::to_string),
+            fields: fields
+                .iter()
+                .map(|(field, at_line)| pontix_core::ArchField {
+                    name: FieldName::new(*field),
+                    within: Vec::new(),
+                    locator: false,
+                    location: at(file, *at_line),
+                })
+                .collect(),
+        }),
+        location: at(file, line),
+    }
+}
+
+fn reference(file: &str, xmlid: &str, kind: RefKind, line: u32) -> pontix_core::XmlRef {
+    pontix_core::XmlRef {
+        xmlid: xmlid.to_string(),
+        kind,
+        location: at(file, line),
+    }
+}
+
+#[test]
+fn checks_views_records_and_external_ids_in_data_files() {
+    const CORE: &str = "sale/views/sale.xml";
+    const MINE: &str = "custom_sale/views/sale.xml";
+    let mut source = source();
+    let mut target = target();
+    let core_view = || {
+        view(
+            CORE,
+            "view_order_form",
+            Some("sale.order"),
+            None,
+            &[("note", 5)],
+            3,
+        )
+    };
+    let old_action = pontix_core::Record {
+        id: Some("action_old".to_string()),
+        model: name("ir.actions.act_window"),
+        fields: Vec::new(),
+        view: None,
+        location: at(CORE, 20),
+    };
+    let records = || {
+        [
+            model(
+                "base/models.py",
+                "ir.ui.view",
+                Inherit::Absent,
+                vec![],
+                vec![],
+            ),
+            model(
+                "base/models.py",
+                "ir.actions.act_window",
+                Inherit::Absent,
+                vec![],
+                vec![],
+            ),
+        ]
+    };
+    source.modules[0].models.extend(records());
+    target.modules[0].models.extend(records());
+    source.modules[1].data = vec![data(CORE, vec![core_view(), old_action], vec![])];
+    target.modules[1].data = vec![data(CORE, vec![core_view()], vec![])];
+    let mine = data(
+        MINE,
+        vec![
+            view(
+                MINE,
+                "view_order_form_custom",
+                None,
+                Some("sale.view_order_form"),
+                &[("partner_id", 6), ("note", 7)],
+                2,
+            ),
+            pontix_core::Record {
+                id: Some("legacy_demo".to_string()),
+                model: name("sale.legacy"),
+                fields: Vec::new(),
+                view: None,
+                location: at(MINE, 10),
+            },
+        ],
+        vec![
+            reference(MINE, "sale.view_order_form", RefKind::InheritId, 4),
+            reference(MINE, "sale.action_old", RefKind::Action, 12),
+            reference(MINE, "sale.model_sale_order", RefKind::Ref, 13),
+            reference(MINE, "view_order_form_custom", RefKind::Ref, 14),
+        ],
+    );
+    for addons in [&mut source, &mut target] {
+        let custom = addons
+            .modules
+            .iter_mut()
+            .find(|module| module.name.as_str() == "custom_sale")
+            .expect("the custom module");
+        custom.data = vec![mine.clone()];
+        custom.xmlid_refs = vec![reference(
+            "custom_sale/models.py",
+            "sale.action_old",
+            RefKind::Python,
+            70,
+        )];
+    }
+    let found: Vec<(String, u32, Problem)> =
+        scan(&source, &target, &[ModuleName::new("custom_sale")], &[])
+            .issues
+            .into_iter()
+            .filter(|issue| {
+                issue.at.file.extension().is_some_and(|ext| ext == "xml")
+                    || issue.at.line.get() == 70
+            })
+            .map(|issue| {
+                (
+                    issue.at.file.display().to_string(),
+                    issue.at.line.get(),
+                    issue.problem,
+                )
+            })
+            .collect();
+    let gone = |file: &str, line| {
+        (
+            file.to_string(),
+            line,
+            Problem::RecordGone {
+                xmlid: "sale.action_old".to_string(),
+                how: if line == 70 {
+                    RefKind::Python
+                } else {
+                    RefKind::Action
+                },
+            },
+        )
+    };
+    assert_eq!(
+        found,
+        [
+            gone("custom_sale/models.py", 70),
+            (
+                MINE.to_string(),
+                7,
+                Problem::FieldGone {
+                    model: name("sale.order"),
+                    field: FieldName::new("note"),
+                    path: "note".to_string(),
+                    how: PathUse::View("custom_sale.view_order_form_custom".to_string()),
+                    renamed: None,
+                },
+            ),
+            (
+                MINE.to_string(),
+                10,
+                Problem::ModelGone {
+                    model: name("sale.legacy"),
+                    how: ModelUse::Record,
+                    renamed: None,
+                },
+            ),
+            gone(MINE, 12),
+        ]
     );
 }

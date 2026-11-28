@@ -378,6 +378,8 @@ mod tests {
             },
             python_files: Vec::new(),
             models,
+            xmlid_refs: Vec::new(),
+            data: Vec::new(),
         }
     }
 

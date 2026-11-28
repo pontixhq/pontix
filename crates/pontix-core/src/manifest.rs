@@ -52,6 +52,8 @@ pub struct Manifest {
     pub depends: Vec<ModuleName>,
     /// `data`: data files relative to the module directory, in load order.
     pub data: Vec<String>,
+    /// `demo`: demo data files, loaded after `data` when demo data is on.
+    pub demo: Vec<String>,
     /// `installable`; `None` when not written.
     pub installable: Option<bool>,
     /// `auto_install`.

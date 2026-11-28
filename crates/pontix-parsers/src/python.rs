@@ -12,9 +12,9 @@ use std::path::Path;
 
 use pontix_core::{
     Delegation, Diagnostic, DiagnosticKind, FieldDef, FieldName, FieldPaths, Inherit, MethodDef,
-    ModelBase, ModelDef, ModelName, Written,
+    ModelBase, ModelDef, ModelName, RefKind, Written, XmlRef,
 };
-use ruff_python_ast::visitor::{Visitor, walk_stmt};
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{Expr, ExprList, ExprName, ExprTuple, Stmt, StmtClassDef};
 use ruff_python_parser::parse_module;
 use ruff_text_size::{Ranged, TextRange, TextSize};
@@ -75,6 +75,9 @@ pub struct PythonFile {
     /// functions, classes and import aliases. `from . import x` may import
     /// such a name from a package's `__init__.py` instead of a file.
     pub bound_names: Vec<String>,
+    /// `env.ref('module.xmlid')` calls with a string literal, anywhere in
+    /// the file, in source order.
+    pub xmlid_refs: Vec<XmlRef>,
     /// Everything that could not be read, in source order.
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -102,6 +105,17 @@ pub fn parse_python(file: &Path, source: &str) -> PythonFile {
                     compound => reader.nested_classes(compound),
                 }
             }
+            let mut refs = EnvRefs { found: Vec::new() };
+            refs.visit_body(&parsed.syntax().body);
+            reader.out.xmlid_refs = refs
+                .found
+                .into_iter()
+                .map(|(xmlid, at)| XmlRef {
+                    xmlid,
+                    kind: RefKind::Python,
+                    location: reader.source.location(at),
+                })
+                .collect();
         }
         Err(error) => reader.report_line(DiagnosticKind::SyntaxError, error.location.start()),
     }
@@ -396,6 +410,31 @@ impl<'s> Visitor<'s> for NestedClasses<'_, '_> {
     }
 }
 
+/// Finds `env.ref("module.xmlid")` and `self.env.ref(...)` calls whose
+/// first argument is a string literal.
+struct EnvRefs {
+    found: Vec<(String, TextSize)>,
+}
+
+impl<'s> Visitor<'s> for EnvRefs {
+    fn visit_expr(&mut self, expr: &'s Expr) {
+        if let Expr::Call(call) = expr
+            && let Expr::Attribute(attribute) = &*call.func
+            && attribute.attr.as_str() == "ref"
+            && match &*attribute.value {
+                Expr::Name(name) => name.id.as_str() == "env",
+                Expr::Attribute(env) => env.attr.as_str() == "env",
+                _ => false,
+            }
+            && let Some(Expr::StringLiteral(literal)) = call.arguments.args.first()
+        {
+            self.found
+                .push((literal.value.to_str().to_string(), call.start()));
+        }
+        walk_expr(self, expr);
+    }
+}
+
 /// A class body statement that decides whether the model has a table.
 enum Table {
     /// `_auto = ...`.
@@ -622,6 +661,32 @@ mod tests {
         ]);
         let classes: Vec<&str> = file.models.iter().map(|m| m.class_name.as_str()).collect();
         assert_eq!(classes, ["A", "B", "C", "D", "E", "F", "G"]);
+    }
+
+    #[test]
+    fn finds_env_ref_calls_anywhere() {
+        let file = parse(&[
+            "GROUP = 'base.group_user'",
+            "class Order(models.Model):",
+            "    _name = 'sale.order'",
+            "    def action(self):",
+            "        template = self.env.ref('sale.email_template_edi_sale')",
+            "        return self.env.ref(GROUP)",
+            "def hook(env):",
+            "    env.ref(\"base.main_company\").write({})",
+        ]);
+        let refs: Vec<(&str, u32)> = file
+            .xmlid_refs
+            .iter()
+            .map(|r| (r.xmlid.as_str(), r.location.line.get()))
+            .collect();
+        assert_eq!(
+            refs,
+            [
+                ("sale.email_template_edi_sale", 5),
+                ("base.main_company", 8)
+            ]
+        );
     }
 
     #[test]

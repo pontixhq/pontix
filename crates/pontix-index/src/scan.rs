@@ -2,10 +2,12 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use pontix_core::{Diagnostic, DiagnosticKind, Manifest, ModelDef, ModuleName, OdooVersion};
-use pontix_parsers::parse_manifest;
+use pontix_core::{
+    DataFile, Diagnostic, DiagnosticKind, Manifest, ModelDef, ModuleName, OdooVersion, XmlRef,
+};
+use pontix_parsers::{parse_manifest, parse_xml};
 
 use crate::bases;
 use crate::files::{Root, whole_file};
@@ -26,6 +28,11 @@ pub struct Module {
     pub python_files: Vec<PathBuf>,
     /// Model classes from those files, in the order Python defines them.
     pub models: Vec<ModelDef>,
+    /// `env.ref(...)` calls in those files.
+    pub xmlid_refs: Vec<XmlRef>,
+    /// The XML files of `data`, then `demo`, in load order, with what each
+    /// declares.
+    pub data: Vec<(PathBuf, DataFile)>,
 }
 
 /// Every module found in a set of addons paths.
@@ -146,6 +153,7 @@ fn scan_module(
             })
             .collect(),
     );
+    let data = data_files(root, dir, &manifest, &mut addons.diagnostics);
     addons.modules.push(Module {
         name,
         path: dir.to_path_buf(),
@@ -154,7 +162,48 @@ fn scan_module(
         python_files: loaded.files,
         // Filled in once candidates are resolved.
         models: Vec::new(),
+        xmlid_refs: loaded.xmlid_refs,
+        data,
     });
+}
+
+/// Reads the XML files the manifest lists in `data` and `demo`. Other files,
+/// such as CSV, are not read. A path that leaves the module directory is not
+/// followed; one Odoo cannot read is reported, since Odoo would fail to
+/// install the module.
+fn data_files(
+    root: &Root,
+    dir: &Path,
+    manifest: &Manifest,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<(PathBuf, DataFile)> {
+    let mut files = Vec::new();
+    for listed in manifest.data.iter().chain(&manifest.demo) {
+        let relative = Path::new(listed);
+        let inside = relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+        if !inside {
+            diagnostics.push(whole_file(DiagnosticKind::OutsideRoot, &dir.join(relative)));
+            continue;
+        }
+        if relative
+            .extension()
+            .is_none_or(|extension| extension != "xml")
+        {
+            continue;
+        }
+        let path = dir.join(relative);
+        match root.read(&path) {
+            Ok(text) => {
+                let parsed = parse_xml(&path, &text);
+                diagnostics.extend(parsed.diagnostics);
+                files.push((path, parsed.data));
+            }
+            Err(diagnostic) => diagnostics.push(diagnostic),
+        }
+    }
+    files
 }
 
 #[cfg(test)]
@@ -219,6 +268,40 @@ mod tests {
 
     fn kinds(addons: &Addons) -> Vec<DiagnosticKind> {
         addons.diagnostics.iter().map(|d| d.kind).collect()
+    }
+
+    #[test]
+    fn reads_the_xml_files_the_manifest_lists() {
+        let tree = Tree::new();
+        tree.write(
+            "sale_custom/__manifest__.py",
+            "{'name': 'Test', 'data': ['security/ir.model.access.csv', 'views/sale.xml', \
+             '../other/views.xml', 'views/missing.xml'], 'demo': ['demo/demo.xml']}",
+        )
+        .write("sale_custom/__init__.py", "")
+        .write("sale_custom/security/ir.model.access.csv", "id,name\n")
+        .write(
+            "sale_custom/views/sale.xml",
+            "<odoo><record id='x' model='res.partner'/></odoo>",
+        )
+        .write("sale_custom/views/unlisted.xml", "<odoo/>")
+        .write(
+            "sale_custom/demo/demo.xml",
+            "<odoo><menuitem id='m'/></odoo>",
+        )
+        .write("other/views.xml", "<odoo/>");
+        let addons = tree.scan(OdooVersion::V19);
+        let module = &addons.modules[0];
+        let read: Vec<PathBuf> = module.data.iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(
+            relative(&tree, &read),
+            ["sale_custom/views/sale.xml", "sale_custom/demo/demo.xml"]
+        );
+        assert_eq!(module.data[0].1.records[0].model.as_str(), "res.partner");
+        assert_eq!(
+            kinds(&addons),
+            [DiagnosticKind::OutsideRoot, DiagnosticKind::UnreadableFile]
+        );
     }
 
     #[test]
