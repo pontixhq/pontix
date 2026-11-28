@@ -20,4 +20,4 @@ mod scan;
 
 pub use files::MAX_FILE_SIZE;
 pub use install::{InstallOptions, Installation, ModelRef, install, install_with};
-pub use scan::{Addons, Module, scan};
+pub use scan::{Addons, Module, ScanOptions, scan, scan_with};

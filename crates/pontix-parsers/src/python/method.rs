@@ -158,7 +158,7 @@ impl Hasher for Fnv1a {
     }
 }
 
-fn is_staticmethod(def: &StmtFunctionDef) -> bool {
+pub(super) fn is_staticmethod(def: &StmtFunctionDef) -> bool {
     def.decorator_list
         .iter()
         .any(|decorator| match &decorator.expression {

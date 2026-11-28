@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod change;
+pub mod code;
 pub mod data;
 pub mod diagnostic;
 pub mod field_type;
@@ -17,6 +18,7 @@ pub mod symbol;
 pub mod version;
 
 pub use change::{Change, ChangeSet, Confidence, Evidence, Rename};
+pub use code::{CodeRef, CodeRoot, CodeUse};
 pub use data::{ArchField, DataFile, Record, RefKind, View, XmlRef};
 pub use diagnostic::{Diagnostic, DiagnosticKind};
 pub use field_type::FieldType;

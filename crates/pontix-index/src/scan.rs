@@ -5,13 +5,14 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use pontix_core::{
-    DataFile, Diagnostic, DiagnosticKind, Manifest, ModelDef, ModuleName, OdooVersion, XmlRef,
+    CodeRef, DataFile, Diagnostic, DiagnosticKind, Manifest, ModelDef, ModuleName, OdooVersion,
+    XmlRef,
 };
 use pontix_parsers::{parse_manifest, parse_xml};
 
 use crate::bases;
 use crate::files::{Root, whole_file};
-use crate::load::{Class, PythonSource, load};
+use crate::load::{Class, PythonSource, load, load_tests};
 
 /// One Odoo module and what Odoo would load from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +31,11 @@ pub struct Module {
     pub models: Vec<ModelDef>,
     /// `env.ref(...)` calls in those files.
     pub xmlid_refs: Vec<XmlRef>,
+    /// Fields and models used by code outside model classes in those files.
+    /// Methods of models keep theirs in [`pontix_core::MethodDef::code_refs`].
+    pub code_refs: Vec<CodeRef>,
+    /// Fields and models used by the module's tests.
+    pub test_refs: Vec<CodeRef>,
     /// The XML files of `data`, then `demo`, in load order, with what each
     /// declares.
     pub data: Vec<(PathBuf, DataFile)>,
@@ -50,6 +56,25 @@ pub struct Addons {
 /// directory directly inside an addons path holding a manifest file. When a
 /// name appears in several paths, the first one wins, as in Odoo.
 pub fn scan(addons_paths: &[PathBuf], version: OdooVersion) -> Addons {
+    scan_with(addons_paths, version, ScanOptions::default())
+}
+
+/// What [`scan_with`] reads beyond the declarations of each module.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanOptions<'a> {
+    /// Read method bodies and tests only of the modules in these addons
+    /// paths, written exactly as in the list given to [`scan_with`]. Empty
+    /// means every module: [`scan`] reads them all.
+    pub read_code_in: &'a [PathBuf],
+}
+
+/// [`scan`], with `options`. Reading bodies and tests costs time that core
+/// modules, which are never checked, do not need.
+pub fn scan_with(
+    addons_paths: &[PathBuf],
+    version: OdooVersion,
+    options: ScanOptions<'_>,
+) -> Addons {
     let mut addons = Addons {
         version,
         modules: Vec::new(),
@@ -75,8 +100,15 @@ pub fn scan(addons_paths: &[PathBuf], version: OdooVersion) -> Addons {
             .filter_map(|entry| Some(entry.ok()?.path()))
             .collect();
         dirs.sort();
+        let read_code =
+            options.read_code_in.is_empty() || options.read_code_in.contains(addons_path);
         for dir in dirs {
-            scan_module(&root, &dir, version, &mut seen, &mut addons, &mut pending);
+            let module = Found {
+                dir: &dir,
+                version,
+                read_code,
+            };
+            scan_module(&root, &module, &mut seen, &mut addons, &mut pending);
         }
     }
     // Bases may live in any module, so candidates are decided last.
@@ -95,14 +127,21 @@ struct Pending {
     sources: Vec<PythonSource>,
 }
 
+/// A directory that may hold a module, and how to read it.
+struct Found<'a> {
+    dir: &'a Path,
+    version: OdooVersion,
+    read_code: bool,
+}
+
 fn scan_module(
     root: &Root,
-    dir: &Path,
-    version: OdooVersion,
+    found: &Found<'_>,
     seen: &mut HashSet<ModuleName>,
     addons: &mut Addons,
     pending: &mut Pending,
 ) {
+    let (dir, version) = (found.dir, found.version);
     match root.resolve(dir) {
         Ok(Some(canonical)) if canonical.is_dir() => {}
         Ok(_) => return,
@@ -136,7 +175,7 @@ fn scan_module(
     let Some(manifest) = parsed.manifest else {
         return;
     };
-    let loaded = load(root, dir, &name);
+    let loaded = load(root, dir, &name, found.read_code);
     addons.diagnostics.extend(loaded.diagnostics);
     let offset = pending.sources.len();
     pending.sources.extend(loaded.sources);
@@ -154,6 +193,11 @@ fn scan_module(
             .collect(),
     );
     let data = data_files(root, dir, &manifest, &mut addons.diagnostics);
+    let test_refs = if found.read_code {
+        load_tests(root, dir, &name)
+    } else {
+        Vec::new()
+    };
     addons.modules.push(Module {
         name,
         path: dir.to_path_buf(),
@@ -163,6 +207,8 @@ fn scan_module(
         // Filled in once candidates are resolved.
         models: Vec::new(),
         xmlid_refs: loaded.xmlid_refs,
+        code_refs: loaded.code_refs,
+        test_refs,
         data,
     });
 }
@@ -583,5 +629,84 @@ mod tests {
         let addons = tree.scan(OdooVersion::V19);
         assert!(addons.modules[0].models.is_empty());
         assert_eq!(kinds(&addons), [DiagnosticKind::OutsideRoot]);
+    }
+
+    fn ref_paths(refs: &[CodeRef]) -> Vec<String> {
+        refs.iter().map(|found| found.path.join(".")).collect()
+    }
+
+    fn lines(lines: &[&str]) -> String {
+        lines.join("\n")
+    }
+
+    #[test]
+    fn tests_are_read_for_code_only_and_only_inside_tests() {
+        let tree = Tree::new();
+        let model = lines(&[
+            "from odoo import models",
+            "class Partner(models.Model):",
+            "    _inherit = 'res.partner'",
+            "    def run(self):",
+            "        return self.email",
+            "def hook(env):",
+            "    env['res.users'].search([('login', '=', 'a')])",
+        ]);
+        let test = lines(&[
+            "from odoo import models",
+            "from odoo.tests import TransactionCase",
+            "class TestM(TransactionCase):",
+            "    def test_one(self):",
+            "        self.env['res.partner'].create({'groups_id': []})",
+            "class Fake(models.Model):",
+            "    _name = 'm.fake'",
+            "    def run(self):",
+            "        self.env['res.users'].login",
+            "        return self.name",
+        ]);
+        tree.module("m", "from . import models\n")
+            .write("m/models.py", model)
+            .write(
+                "m/tests/__init__.py",
+                "from . import test_m\nfrom .. import models\n",
+            )
+            .write("m/tests/test_m.py", test)
+            .write(
+                "m/tests/unused.py",
+                "def f(env):\n    env['res.users'].name\n",
+            );
+        let addons = tree.scan(OdooVersion::V19);
+        let module = &addons.modules[0];
+        assert_eq!(class_names(module), ["Partner"]);
+        assert_eq!(ref_paths(&module.models[0].methods[0].code_refs), ["email"]);
+        assert_eq!(ref_paths(&module.code_refs), ["", "login"]);
+        // `from .. import models` leaves tests/ and is not read again, and
+        // the fake model's own fields are not the module's.
+        assert_eq!(ref_paths(&module.test_refs), ["", "groups_id", "login", ""]);
+    }
+
+    #[test]
+    fn code_is_read_only_in_the_addons_paths_asked_for() {
+        let core = Tree::new();
+        let model = lines(&[
+            "from odoo import models",
+            "class Partner(models.Model):",
+            "    _name = 'res.partner'",
+            "    def run(self):",
+            "        return self.email",
+        ]);
+        core.module("base", "from . import models\n")
+            .write("base/models.py", model);
+        let custom = Tree::new();
+        custom.module("m", "").write(
+            "m/tests/__init__.py",
+            "def f(env):\n    env['res.partner'].email\n",
+        );
+        let paths = [core.path(), custom.path()];
+        let options = ScanOptions {
+            read_code_in: &paths[1..],
+        };
+        let addons = scan_with(&paths, OdooVersion::V19, options);
+        assert!(addons.modules[0].models[0].methods[0].code_refs.is_empty());
+        assert_eq!(ref_paths(&addons.modules[1].test_refs), ["email", ""]);
     }
 }

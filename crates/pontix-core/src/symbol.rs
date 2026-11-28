@@ -1,6 +1,7 @@
 //! Symbols extracted from Odoo source code, exactly as written: models,
 //! fields and methods. Version-specific Odoo rules live in [`crate::resolve`].
 
+use crate::code::CodeRef;
 use crate::field_type::FieldType;
 use std::fmt;
 use std::num::NonZeroU32;
@@ -186,6 +187,8 @@ pub struct MethodDef {
     /// Field paths its `@api.depends`, `@api.onchange` and `@api.constrains`
     /// decorators name.
     pub field_paths: Vec<FieldPaths>,
+    /// The fields and models its body uses, where their model is certain.
+    pub code_refs: Vec<CodeRef>,
     /// What the method does, as a fingerprint of its decorators, parameter
     /// names and defaults, and body. Formatting, comments, the docstring and
     /// type annotations do not count. Two definitions with the same

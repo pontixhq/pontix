@@ -4,6 +4,7 @@
 //! models. Whatever cannot be read with certainty becomes a [`Diagnostic`]
 //! carrying the source text exactly as written.
 
+mod code;
 mod field;
 mod method;
 mod module_level;
@@ -11,14 +12,15 @@ mod module_level;
 use std::path::Path;
 
 use pontix_core::{
-    Delegation, Diagnostic, DiagnosticKind, FieldDef, FieldName, FieldPaths, Inherit, MethodDef,
-    ModelBase, ModelDef, ModelName, RefKind, Written, XmlRef,
+    CodeRef, Delegation, Diagnostic, DiagnosticKind, FieldDef, FieldName, FieldPaths, Inherit,
+    MethodDef, ModelBase, ModelDef, ModelName, RefKind, Written, XmlRef,
 };
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{Expr, ExprList, ExprName, ExprTuple, Stmt, StmtClassDef};
 use ruff_python_parser::parse_module;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
+use self::code::Owner;
 use self::field::{Comodel, Field};
 pub use self::module_level::Import;
 use crate::source::SourceFile;
@@ -78,6 +80,10 @@ pub struct PythonFile {
     /// `env.ref('module.xmlid')` calls with a string literal, anywhere in
     /// the file, in source order.
     pub xmlid_refs: Vec<XmlRef>,
+    /// The fields and models used by code outside model classes: functions
+    /// and the methods of other classes, such as test cases. Methods of
+    /// model classes keep theirs in [`MethodDef::code_refs`].
+    pub code_refs: Vec<CodeRef>,
     /// Everything that could not be read, in source order.
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -89,8 +95,17 @@ pub struct PythonFile {
 /// [`DiagnosticKind::SyntaxError`] and no models or imports, because Odoo
 /// cannot import it.
 pub fn parse_python(file: &Path, source: &str) -> PythonFile {
+    parse_python_with(file, source, true)
+}
+
+/// [`parse_python`], reading what method and function bodies use only when
+/// `read_code` is true: [`PythonFile::code_refs`] and
+/// [`MethodDef::code_refs`] stay empty otherwise. Reading bodies costs time
+/// that core modules, which are never checked, do not need.
+pub fn parse_python_with(file: &Path, source: &str, read_code: bool) -> PythonFile {
     let mut reader = Reader {
         source: SourceFile::new(file, source),
+        read_code,
         out: PythonFile::default(),
     };
     match parse_module(source) {
@@ -101,6 +116,10 @@ pub fn parse_python(file: &Path, source: &str) -> PythonFile {
             for stmt in &parsed.syntax().body {
                 match stmt {
                     Stmt::ClassDef(class) => reader.class(class),
+                    Stmt::FunctionDef(def) if reader.read_code => {
+                        let refs = code::refs(&reader.source, def, Owner::Function);
+                        reader.out.code_refs.extend(refs);
+                    }
                     Stmt::FunctionDef(_) => {}
                     compound => reader.nested_classes(compound),
                 }
@@ -125,6 +144,8 @@ pub fn parse_python(file: &Path, source: &str) -> PythonFile {
 /// One file being read; collects models and diagnostics as it goes.
 struct Reader<'a> {
     source: SourceFile<'a>,
+    /// Whether to read what bodies use.
+    read_code: bool,
     out: PythonFile,
 }
 
@@ -139,7 +160,7 @@ impl Reader<'_> {
             .iter()
             .any(|base| is_model_base(base) || self.is_model_class_in_this_file(base))
         {
-            let model = self.read_model(class);
+            let model = self.read_model(class, true);
             self.out.models.push(model);
             return;
         }
@@ -158,13 +179,18 @@ impl Reader<'_> {
                     class.name.range.start(),
                 );
             }
-            return;
+            return self.plain_class(class);
         }
 
         // Read it as a model, keeping its diagnostics apart: they only count
         // if the indexer finds that a base is a model class.
+        // A class that sets no model attribute is most likely a test case or
+        // a helper: its `self` is not read as records.
+        if !sets_model_attributes {
+            self.plain_class(class);
+        }
         let before = self.out.diagnostics.len();
-        let model = self.read_model(class);
+        let model = self.read_model(class, sets_model_attributes);
         let diagnostics = self.out.diagnostics.split_off(before);
         self.out.candidates.push(Candidate {
             model,
@@ -178,8 +204,24 @@ impl Reader<'_> {
         });
     }
 
+    /// The fields and models used by the methods of a class that is not a
+    /// model.
+    fn plain_class(&mut self, class: &StmtClassDef) {
+        if !self.read_code {
+            return;
+        }
+        let attributes = code::attributes(&self.source, class);
+        for stmt in &class.body {
+            if let Stmt::FunctionDef(def) = stmt {
+                let refs = code::refs(&self.source, def, Owner::Plain(&attributes));
+                self.out.code_refs.extend(refs);
+            }
+        }
+    }
+
     /// Reads a class body as a model: identity, inheritance, fields, methods.
-    fn read_model(&mut self, class: &StmtClassDef) -> ModelDef {
+    /// `own_refs` reads what the methods use through `self`.
+    fn read_model(&mut self, class: &StmtClassDef, own_refs: bool) -> ModelDef {
         let mut model = ModelDef {
             class_name: class.name.as_str().to_string(),
             name: None,
@@ -215,6 +257,11 @@ impl Reader<'_> {
                             location: self.source.location(at),
                         })
                         .collect(),
+                    code_refs: if own_refs && self.read_code {
+                        code::refs(&self.source, def, Owner::Model)
+                    } else {
+                        Vec::new()
+                    },
                     fingerprint: method::fingerprint(def),
                     location: self.source.location(def.name.range.start()),
                 });

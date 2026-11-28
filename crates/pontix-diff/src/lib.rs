@@ -335,6 +335,7 @@ mod tests {
             params: params.iter().map(|p| p.to_string()).collect(),
             calls_super: false,
             field_paths: Vec::new(),
+            code_refs: Vec::new(),
             fingerprint,
             location: at("models.py", line),
         }
@@ -381,6 +382,8 @@ mod tests {
             python_files: Vec::new(),
             models,
             xmlid_refs: Vec::new(),
+            code_refs: Vec::new(),
+            test_refs: Vec::new(),
             data: Vec::new(),
         }
     }

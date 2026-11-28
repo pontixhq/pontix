@@ -13,6 +13,6 @@ mod source;
 pub mod xml;
 
 pub use manifest::{ManifestFile, parse_manifest};
-pub use python::{Candidate, Import, PythonFile, parse_python};
+pub use python::{Candidate, Import, PythonFile, parse_python, parse_python_with};
 pub use release::release_version;
 pub use xml::{XmlFile, parse_xml};

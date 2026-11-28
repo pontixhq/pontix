@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use pontix_core::{Diagnostic, DiagnosticKind, ModelDef, ModuleName, XmlRef};
-use pontix_parsers::{Candidate, Import, parse_python};
+use pontix_core::{CodeRef, CodeRoot, Diagnostic, DiagnosticKind, ModelDef, ModuleName, XmlRef};
+use pontix_parsers::{Candidate, Import, parse_python_with};
 
 use crate::files::Root;
 
@@ -18,6 +18,8 @@ pub(crate) struct Loaded {
     pub(crate) sources: Vec<PythonSource>,
     /// `env.ref(...)` calls in those files.
     pub(crate) xmlid_refs: Vec<XmlRef>,
+    /// Fields and models used outside model classes in those files.
+    pub(crate) code_refs: Vec<CodeRef>,
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
@@ -46,18 +48,56 @@ pub(crate) struct PythonSource {
 }
 
 /// Loads every Python file of the module that Python would run when Odoo
-/// imports `odoo.addons.<module>`.
-pub(crate) fn load(root: &Root, module_dir: &Path, module: &ModuleName) -> Loaded {
+/// imports `odoo.addons.<module>`. What bodies use is read only when
+/// `read_code` is true.
+pub(crate) fn load(root: &Root, module_dir: &Path, module: &ModuleName, read_code: bool) -> Loaded {
     let mut loader = Loader {
         root,
         module_dir,
         module: module.as_str(),
+        read_code,
+        within: None,
         visited: HashSet::new(),
         bound_names: HashMap::new(),
         out: Loaded::default(),
     };
     loader.file(&module_dir.join("__init__.py"));
     loader.out
+}
+
+/// The fields and models the module's tests use: the files Odoo's test
+/// runner imports from `tests/__init__.py`, without leaving `tests/`.
+/// Classes there are never models of the module, so only what their code
+/// opens through `env` counts; what they read could not be read is not the
+/// module's problem and is not reported.
+pub(crate) fn load_tests(root: &Root, module_dir: &Path, module: &ModuleName) -> Vec<CodeRef> {
+    let tests = module_dir.join("tests");
+    let mut loader = Loader {
+        root,
+        module_dir,
+        module: module.as_str(),
+        read_code: true,
+        within: Some(tests.clone()),
+        visited: HashSet::new(),
+        bound_names: HashMap::new(),
+        out: Loaded::default(),
+    };
+    loader.file(&tests.join("__init__.py"));
+    let mut refs = loader.out.code_refs;
+    for class in loader.out.classes {
+        let model = match class {
+            Class::Model(model) => model,
+            Class::Candidate { candidate, .. } => candidate.model,
+        };
+        refs.extend(
+            model
+                .methods
+                .into_iter()
+                .flat_map(|method| method.code_refs)
+                .filter(|found| found.root != CodeRoot::Own),
+        );
+    }
+    refs
 }
 
 /// What one dotted name refers to.
@@ -81,6 +121,9 @@ struct Loader<'a> {
     root: &'a Root,
     module_dir: &'a Path,
     module: &'a str,
+    read_code: bool,
+    /// Files outside this directory are not read, when set.
+    within: Option<PathBuf>,
     visited: HashSet<PathBuf>,
     /// Module-level names of every file read, by canonical path.
     bound_names: HashMap<PathBuf, Vec<String>>,
@@ -91,6 +134,13 @@ impl Loader<'_> {
     /// Runs one file: its models and the files it imports, interleaved in
     /// statement order, since an import loads the other file at that point.
     fn file(&mut self, path: &Path) {
+        if self
+            .within
+            .as_ref()
+            .is_some_and(|within| !path.starts_with(within))
+        {
+            return;
+        }
         let canonical = match self.root.resolve(path) {
             Ok(Some(canonical)) => canonical,
             Ok(None) => return,
@@ -103,11 +153,12 @@ impl Loader<'_> {
             Ok(source) => source,
             Err(diagnostic) => return self.out.diagnostics.push(diagnostic),
         };
-        let parsed = parse_python(path, &source);
+        let parsed = parse_python_with(path, &source, self.read_code);
         self.bound_names.insert(canonical, parsed.bound_names);
         self.out.files.push(path.to_path_buf());
         self.out.diagnostics.extend(parsed.diagnostics);
         self.out.xmlid_refs.extend(parsed.xmlid_refs);
+        self.out.code_refs.extend(parsed.code_refs);
 
         let index = self.out.sources.len();
         self.out.sources.push(PythonSource {

@@ -315,6 +315,8 @@ mod tests {
             python_files: Vec::new(),
             models: Vec::new(),
             xmlid_refs: Vec::new(),
+            code_refs: Vec::new(),
+            test_refs: Vec::new(),
             data: Vec::new(),
         }
     }
