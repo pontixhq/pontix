@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use pontix_core::{
-    ArchField, DataFile, Diagnostic, DiagnosticKind, FieldName, Location, ModelName, Record,
-    RefKind, View, XmlRef,
+    ArchField, DataFile, Diagnostic, DiagnosticKind, Element, FieldName, Location, ModelName,
+    Record, RefKind, View, XmlRef,
 };
 use roxmltree::{Document, Node, ParsingOptions};
 use ruff_python_ast::Expr;
@@ -125,14 +125,30 @@ impl Reader<'_> {
                 "data" => self.container(child, depth + 1),
                 "record" => self.record(child, depth + 1),
                 "template" => {
+                    let id = child.attribute("id").map(str::to_string);
+                    // Odoo stores a template as `<t t-name="...">` around
+                    // its content.
+                    let mut arch = self.element(child, depth + 1);
+                    arch.tag = "t".to_string();
+                    arch.attributes = id
+                        .iter()
+                        .map(|id| ("t-name".to_string(), id.clone()))
+                        .collect();
                     self.out.data.records.push(Record {
-                        id: child.attribute("id").map(str::to_string),
+                        id,
                         model: ModelName::new("ir.ui.view"),
                         fields: Vec::new(),
                         view: Some(View {
                             model: None,
                             inherit_id: child.attribute("inherit_id").map(str::to_string),
                             fields: Vec::new(),
+                            arch: Some(arch),
+                            primary: child
+                                .attribute("primary")
+                                .is_some_and(|primary| primary.eq_ignore_ascii_case("true")),
+                            priority: child
+                                .attribute("priority")
+                                .and_then(|priority| priority.trim().parse().ok()),
                         }),
                         location: self.location(child),
                     });
@@ -208,7 +224,18 @@ impl Reader<'_> {
             match name {
                 "model" => view.model = field.text().map(|text| ModelName::new(text.trim())),
                 "inherit_id" => view.inherit_id = field.attribute("ref").map(str::to_string),
-                "arch" => view.fields = self.arch(field, depth + 1),
+                "arch" => {
+                    view.fields = self.arch(field, depth + 1);
+                    view.arch = field
+                        .children()
+                        .find(Node::is_element)
+                        .map(|root| self.element(root, depth + 2));
+                }
+                "mode" => view.primary = field.text().is_some_and(|mode| mode.trim() == "primary"),
+                "priority" => {
+                    let written = field.text().or_else(|| field.attribute("eval"));
+                    view.priority = written.and_then(|priority| priority.trim().parse().ok());
+                }
                 _ => {}
             }
         }
@@ -219,6 +246,28 @@ impl Reader<'_> {
             view,
             location: self.location(node),
         });
+    }
+
+    /// An element and the elements inside it, down to the deepest level
+    /// Pontix follows. Text and comments are left out.
+    fn element(&self, node: Node<'_, '_>, depth: usize) -> Element {
+        let children = if depth < MAX_DEPTH {
+            node.children()
+                .filter(Node::is_element)
+                .map(|child| self.element(child, depth + 1))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Element {
+            tag: node.tag_name().name().to_string(),
+            attributes: node
+                .attributes()
+                .map(|attribute| (attribute.name().to_string(), attribute.value().to_string()))
+                .collect(),
+            children,
+            location: self.location(node),
+        }
     }
 
     /// The `<field>` elements of a view architecture, each with the x2many
@@ -503,6 +552,57 @@ mod tests {
         );
         assert_eq!(records[1].model, ModelName::new("res.partner.category"));
         assert_eq!(records[1].fields[0].0, FieldName::new("name"));
+        let arch = view.arch.as_ref().expect("the architecture");
+        assert_eq!(arch.tag, "form");
+        assert_eq!(arch.location.line.get(), 8);
+        let line = arch.at(&[1, 0, 0]).expect("the embedded field");
+        assert_eq!(
+            (line.tag.as_str(), line.attribute("name")),
+            ("field", Some("product_id"))
+        );
+        assert!(!view.primary);
+        assert_eq!(view.priority, None);
+    }
+
+    #[test]
+    fn views_keep_their_mode_priority_and_template_content() {
+        let file = parse(&[
+            "<odoo>",
+            "  <record id='view_form_mine' model='ir.ui.view'>",
+            "    <field name='inherit_id' ref='sale.view_order_form'/>",
+            "    <field name='mode'>primary</field>",
+            "    <field name='priority' eval='20'/>",
+            "    <field name='arch' type='xml'>",
+            "      <!-- a comment -->",
+            "      <xpath expr=\"//field[@name='partner_id']\" position='after'>text</xpath>",
+            "    </field>",
+            "  </record>",
+            "  <template id='report_mine' inherit_id='sale.report' primary='True' priority='5'>",
+            "    <xpath expr='//div' position='inside'><span t-field='doc.name'/></xpath>",
+            "  </template>",
+            "</odoo>",
+        ]);
+        let views: Vec<&View> = file
+            .data
+            .records
+            .iter()
+            .filter_map(|record| record.view.as_ref())
+            .collect();
+        let record = views[0];
+        assert!(record.primary);
+        assert_eq!(record.priority, Some(20));
+        let arch = record.arch.as_ref().expect("the architecture");
+        assert_eq!(arch.tag, "xpath");
+        assert!(arch.children.is_empty());
+        let template = views[1];
+        assert!(template.primary);
+        assert_eq!(template.priority, Some(5));
+        let arch = template.arch.as_ref().expect("the template's content");
+        assert_eq!(
+            (arch.tag.as_str(), arch.attribute("t-name")),
+            ("t", Some("report_mine"))
+        );
+        assert_eq!(arch.at(&[0, 0]).map(|span| span.tag.as_str()), Some("span"));
     }
 
     #[test]

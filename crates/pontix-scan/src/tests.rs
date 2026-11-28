@@ -533,6 +533,7 @@ fn view(
                     location: at(file, *at_line),
                 })
                 .collect(),
+            ..pontix_core::View::default()
         }),
         location: at(file, line),
     }

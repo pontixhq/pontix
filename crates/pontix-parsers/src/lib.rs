@@ -11,6 +11,7 @@ pub mod python;
 pub mod release;
 mod source;
 pub mod xml;
+pub mod xpath;
 
 pub use manifest::{ManifestFile, parse_manifest};
 pub use python::framework::{
@@ -19,3 +20,4 @@ pub use python::framework::{
 pub use python::{Candidate, Import, PythonFile, parse_python, parse_python_with};
 pub use release::release_version;
 pub use xml::{XmlFile, parse_xml};
+pub use xpath::{XPath, XPathError};

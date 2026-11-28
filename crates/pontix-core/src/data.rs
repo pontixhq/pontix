@@ -2,6 +2,7 @@
 //! external ids, view architectures, and references to other records by
 //! external id (`ref=`, `ref('...')`, `groups=`, `env.ref('...')`).
 
+use crate::arch::Element;
 use crate::symbol::{FieldName, Location, ModelName};
 
 /// What one XML data file listed in a manifest declares.
@@ -48,6 +49,14 @@ pub struct View {
     /// The `<field>` elements of its architecture. A QWeb `<template>` has
     /// none: its fields are expressions, which Pontix does not read.
     pub fields: Vec<ArchField>,
+    /// The architecture: the root element of `<field name="arch">`, or for
+    /// a `<template>` a `<t t-name>` holding its content, as Odoo stores it.
+    pub arch: Option<Element>,
+    /// `mode` is `primary`: an inheriting view that makes a view of its own
+    /// rather than extending the one it inherits.
+    pub primary: bool,
+    /// `priority`, as written; Odoo's default is 16.
+    pub priority: Option<i64>,
 }
 
 /// A `<field name=...>` element in a view architecture.

@@ -5,6 +5,7 @@
 //! two Odoo versions, and the findings reported to users (PTX codes).
 #![forbid(unsafe_code)]
 
+pub mod arch;
 pub mod change;
 pub mod code;
 pub mod data;
@@ -17,6 +18,7 @@ pub mod storage;
 pub mod symbol;
 pub mod version;
 
+pub use arch::Element;
 pub use change::{Change, ChangeSet, Confidence, Evidence, Rename};
 pub use code::{CodeRef, CodeRoot, CodeUse};
 pub use data::{ArchField, DataFile, Record, RefKind, View, XmlRef};
