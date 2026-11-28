@@ -24,7 +24,8 @@ mod path;
 pub use findings::{NOT_COVERED, Report, report};
 
 use pontix_core::{
-    ChangeSet, Confidence, FieldName, FieldType, Location, ModelName, ModuleName, RefKind, Storage,
+    ChangeSet, CodeUse, Confidence, FieldName, FieldType, Location, ModelName, ModuleName, RefKind,
+    Storage,
 };
 use pontix_index::{Addons, InstallOptions, install, install_with};
 
@@ -95,6 +96,10 @@ pub enum ModelUse {
     Comodel(FieldName),
     /// The model of a record, `<function>` or `<delete>` in a data file.
     Record,
+    /// `env["model"]` in the module's Python code.
+    Code,
+    /// `env["model"]` in the module's tests.
+    Test,
 }
 
 /// Where a field path is written.
@@ -112,6 +117,10 @@ pub enum PathUse {
     View(String),
     /// A value the record with this external id sets in a data file.
     RecordValue(String),
+    /// The module's Python code.
+    Code(CodeUse),
+    /// The module's tests.
+    Test(CodeUse),
 }
 
 /// What is wrong with a reference to core.

@@ -2,8 +2,8 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use pontix_core::{
-    ApiDecorator, FieldAttrs, FieldDef, FieldPaths, FieldType, Inherit, Manifest, MethodDef,
-    ModelBase, ModelDef, OdooVersion, RefKind, Storage, Written,
+    ApiDecorator, CodeRef, CodeRoot, CodeUse, FieldAttrs, FieldDef, FieldPaths, FieldType, Inherit,
+    Manifest, MethodDef, ModelBase, ModelDef, OdooVersion, RefKind, Severity, Storage, Written,
 };
 use pontix_index::Module;
 
@@ -824,4 +824,141 @@ fn only_renamed_parameters_are_info() {
         .find(|finding| finding.code == PtxCode::P402)
         .expect("the parameters finding");
     assert_eq!(params.severity, Severity::Info);
+}
+
+fn code_ref(root: CodeRoot, path: &[&str], how: CodeUse, line: u32) -> CodeRef {
+    CodeRef {
+        root,
+        path: path.iter().map(|segment| segment.to_string()).collect(),
+        how,
+        location: at("custom_sale/code.py", line),
+    }
+}
+
+/// Adds the same Python code to the module being upgraded in `addons`.
+fn with_code(mut addons: Addons) -> Addons {
+    let custom = addons
+        .modules
+        .iter_mut()
+        .find(|module| module.name.as_str() == "custom_sale")
+        .expect("the custom module");
+    let sale_order = &mut custom.models[0];
+    sale_order.methods[0].code_refs = vec![
+        code_ref(
+            CodeRoot::Own,
+            &["partner_id", "fax"],
+            CodeUse::Attribute,
+            70,
+        ),
+        // Not a field before either: a Python attribute Pontix cannot see.
+        code_ref(CodeRoot::Own, &["helper", "fax"], CodeUse::Attribute, 71),
+        // The module's own field is there as long as its class applies.
+        code_ref(CodeRoot::Own, &["legacy_id"], CodeUse::Attribute, 72),
+    ];
+    custom.code_refs = vec![
+        code_ref(
+            CodeRoot::Model(name("sale.legacy")),
+            &[],
+            CodeUse::Attribute,
+            80,
+        ),
+        // A model that never existed is most likely an optional module.
+        code_ref(
+            CodeRoot::Model(name("never.there")),
+            &[],
+            CodeUse::Attribute,
+            81,
+        ),
+        code_ref(
+            CodeRoot::Model(name("sale.order")),
+            &["note"],
+            CodeUse::Domain,
+            82,
+        ),
+    ];
+    custom.test_refs = vec![code_ref(
+        CodeRoot::Model(name("sale.order")),
+        &["partner_id", "fax"],
+        CodeUse::Values,
+        90,
+    )];
+    addons
+}
+
+#[test]
+fn code_and_tests_report_only_what_existed_before() {
+    let scan = scan(
+        &with_code(source()),
+        &with_code(target()),
+        &[ModuleName::new("custom_sale")],
+        &[],
+    );
+    let found: Vec<(u32, Problem)> = in_code(scan.issues.clone())
+        .into_iter()
+        .filter(|issue| issue.at.file.ends_with("code.py"))
+        .map(|issue| (issue.at.line.get(), issue.problem))
+        .collect();
+    let gone = |field: &str, path: &str, how: PathUse, model: &str| Problem::FieldGone {
+        model: name(model),
+        field: FieldName::new(field),
+        path: path.to_string(),
+        how,
+        renamed: None,
+    };
+    assert_eq!(
+        found,
+        [
+            (
+                70,
+                gone(
+                    "fax",
+                    "partner_id.fax",
+                    PathUse::Code(CodeUse::Attribute),
+                    "res.partner"
+                )
+            ),
+            (
+                80,
+                Problem::ModelGone {
+                    model: name("sale.legacy"),
+                    how: ModelUse::Code,
+                    renamed: None,
+                }
+            ),
+            (
+                82,
+                gone("note", "note", PathUse::Code(CodeUse::Domain), "sale.order")
+            ),
+            (
+                90,
+                gone(
+                    "fax",
+                    "partner_id.fax",
+                    PathUse::Test(CodeUse::Values),
+                    "res.partner"
+                )
+            ),
+        ]
+    );
+    let severities: Vec<(String, Severity)> = report(&scan)
+        .findings
+        .into_iter()
+        .filter(|finding| {
+            finding
+                .locations
+                .iter()
+                .any(|at| at.file.ends_with("code.py"))
+        })
+        .map(|finding| (finding.message, finding.severity))
+        .collect();
+    assert!(severities.contains(&(
+        "Field res.partner.fax does not exist in 19.0 (path partner_id.fax in tests, values written)."
+            .to_string(),
+        Severity::Warning
+    )));
+    assert!(severities.contains(&(
+        "Field res.partner.fax does not exist in 19.0 (path partner_id.fax in Python code, attribute)."
+            .to_string(),
+        Severity::Error
+    )));
 }

@@ -13,6 +13,8 @@ use pontix_index::registry::{self, MethodView, ModelView, Xmlid, qualified};
 use pontix_index::{Installation, Module};
 
 use crate::path::{Walk, lookup, walk};
+
+mod code;
 use crate::{Evidence, Issue, ModelUse, PathUse, Problem, Renamed, Since};
 
 /// Where Odoo 19 names a class's model: only a string `_inherit` becomes
@@ -98,6 +100,7 @@ pub(crate) fn check(versions: &Versions<'_, '_, '_>) -> Vec<Issue> {
             checker.class(def);
         }
         checker.data(module);
+        checker.code(module);
     }
     issues
 }
@@ -261,6 +264,9 @@ impl Checker<'_, '_, '_, '_> {
                 for path in &paths.paths {
                     self.path(&name, path, how(method.name.clone()), &paths.location);
                 }
+            }
+            for found in &method.code_refs {
+                self.code_ref(Some(&name), found, false);
             }
             self.overridden(&name, method);
         }
@@ -439,34 +445,14 @@ impl Checker<'_, '_, '_, '_> {
             return;
         };
         let worked = walk(&source.models, model, path) == Walk::Reaches;
-        let before = source
-            .models
-            .get(&on)
-            .and_then(|view| lookup(view, &field))
-            .filter(|_| worked)
-            .map(|found| found.first.clone());
-        let renamed = worked
-            .then(|| {
-                self.versions
-                    .changes
-                    .renames
-                    .iter()
-                    .find_map(|rename| match rename {
-                        Rename::Field {
-                            model,
-                            from,
-                            to_model,
-                            to,
-                            confidence,
-                            ..
-                        } if *model == on && *from == field => Some(Renamed {
-                            to: (to_model.clone(), to.clone()),
-                            confidence: *confidence,
-                        }),
-                        _ => None,
-                    })
-            })
-            .flatten();
+        let existing = source.models.get(&on).and_then(|view| lookup(view, &field));
+        // A field of a module being upgraded disappears only when its class
+        // no longer applies, which is reported on the class.
+        if existing.is_some_and(|found| self.versions.upgrading.contains(found.owner)) {
+            return;
+        }
+        let before = existing.filter(|_| worked).map(|found| found.first.clone());
+        let renamed = worked.then(|| self.field_renamed(&on, &field)).flatten();
         self.push(
             at,
             Problem::FieldGone {
@@ -483,6 +469,32 @@ impl Checker<'_, '_, '_, '_> {
                 rule: None,
             },
         );
+    }
+
+    /// The field core most likely renamed `model.field` to.
+    fn field_renamed(
+        &self,
+        model: &ModelName,
+        field: &FieldName,
+    ) -> Option<Renamed<(ModelName, FieldName)>> {
+        self.versions
+            .changes
+            .renames
+            .iter()
+            .find_map(|rename| match rename {
+                Rename::Field {
+                    model: on,
+                    from,
+                    to_model,
+                    to,
+                    confidence,
+                    ..
+                } if on == model && from == field => Some(Renamed {
+                    to: (to_model.clone(), to.clone()),
+                    confidence: *confidence,
+                }),
+                _ => None,
+            })
     }
 
     /// A field the class declares that core declares too.

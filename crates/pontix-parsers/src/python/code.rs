@@ -21,10 +21,12 @@ use super::method::is_staticmethod;
 use crate::source::SourceFile;
 
 /// Methods that return records of the same model as their receiver.
-const SAME_RECORDS: [&str; 16] = [
+const SAME_RECORDS: [&str; 17] = [
     "browse",
     "copy",
     "create",
+    // `Form`: the line being edited in a one2many.
+    "edit",
     "ensure_one",
     "exists",
     "filtered",
@@ -222,7 +224,10 @@ impl<'a, 's> Code<'a, 's> {
                 Stmt::With(with) => {
                     for item in &with.items {
                         if let Some(target) = &item.optional_vars {
-                            self.bind_target(target, None);
+                            // `with Form(record) as form` and
+                            // `with form.line_ids.new() as line`.
+                            let ty = self.records(&item.context_expr);
+                            self.bind_target(target, ty);
                         }
                     }
                     self.bind_body(&with.body);
@@ -374,7 +379,13 @@ impl<'a, 's> Code<'a, 's> {
 
     fn call(&self, call: &ExprCall) -> Option<Ty> {
         let Expr::Attribute(func) = &*call.func else {
-            return None;
+            // A test `Form` reads and writes the fields of its record.
+            return match &*call.func {
+                Expr::Name(name) if name.id.as_str() == "Form" => {
+                    self.records(call.arguments.args.first()?)
+                }
+                _ => None,
+            };
         };
         let method = func.attr.as_str();
         match self.ty(&func.value)? {
@@ -862,6 +873,9 @@ mod tests {
             "        self.order.order_line.product_uom",
             "        self.partner.write({'groups_id': []})",
             "        self.unknown.name",
+            "        with Form(self.env['purchase.order']) as po:",
+            "            with po.order_line.new() as line:",
+            "                line.taxes_id.clear()",
         ]);
         assert_eq!(
             refs,
@@ -873,6 +887,9 @@ mod tests {
                 "res.partner:id attr 7",
                 "sale.order:order_line.product_uom attr 9",
                 "res.partner:groups_id vals 10",
+                "purchase.order: attr 12",
+                "purchase.order:order_line attr 13",
+                "purchase.order:order_line.taxes_id attr 14",
             ]
         );
     }

@@ -4,7 +4,8 @@
 use std::collections::BTreeMap;
 
 use pontix_core::{
-    Basis, CoreBasis, Finding, ModuleName, OdooVersion, PtxCode, RefKind, Severity, Suggestion,
+    Basis, CodeUse, CoreBasis, Finding, ModuleName, OdooVersion, PtxCode, RefKind, Severity,
+    Suggestion,
 };
 
 use crate::{Issue, ModelUse, PathUse, Problem, Scan, Since};
@@ -16,7 +17,10 @@ pub const NOT_COVERED: &[&str] = &[
     "xpath",
     "view_expressions",
     "qweb",
-    "method_bodies",
+    // Python code whose model Pontix cannot tell, such as a method
+    // parameter, and the framework API it calls.
+    "untyped_python",
+    "core_python_api",
     "csv",
 ];
 
@@ -161,6 +165,8 @@ fn classify(issue: &Issue, target: &str) -> Classified {
                 rename_to: renamed.to.to_string(),
                 confidence: renamed.confidence,
             }),
+            // Broken tests fail CI, not the database.
+            severity: (*how == ModelUse::Test).then_some(Severity::Warning),
             ..plain(
                 if renamed.is_some() {
                     PtxCode::M102
@@ -190,6 +196,7 @@ fn classify(issue: &Issue, target: &str) -> Classified {
                 rename_to: format!("{}.{}", renamed.to.0, renamed.to.1),
                 confidence: renamed.confidence,
             }),
+            severity: matches!(how, PathUse::Test(_)).then_some(Severity::Warning),
             ..plain(
                 if renamed.is_some() {
                     PtxCode::F202
@@ -352,6 +359,8 @@ fn model_use(how: &ModelUse) -> String {
         ModelUse::Delegate => "delegated to".to_string(),
         ModelUse::Comodel(field) => format!("comodel of field {field}"),
         ModelUse::Record => "model of a record in a data file".to_string(),
+        ModelUse::Code => "opened through env in Python code".to_string(),
+        ModelUse::Test => "opened through env in tests".to_string(),
     }
 }
 
@@ -363,6 +372,17 @@ fn path_use(how: &PathUse) -> String {
         PathUse::Constrains(method) => format!("@api.constrains of {method}"),
         PathUse::View(view) => format!("view {view}"),
         PathUse::RecordValue(record) => format!("a value of record {record}"),
+        PathUse::Code(how) => format!("Python code, {}", code_use(*how)),
+        PathUse::Test(how) => format!("tests, {}", code_use(*how)),
+    }
+}
+
+fn code_use(how: CodeUse) -> &'static str {
+    match how {
+        CodeUse::Attribute => "attribute",
+        CodeUse::Values => "values written",
+        CodeUse::Domain => "domain",
+        CodeUse::FieldString => "field name in a string",
     }
 }
 
